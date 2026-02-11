@@ -7,7 +7,7 @@
 
 ![Platform](https://img.shields.io/badge/Platform-Windows-blue?style=flat-square) 
 ![VPS](https://img.shields.io/badge/VPS-Linux-orange?style=flat-square)
-![Tech](https://img.shields.io/badge/Tech-Python%20%7C%20PyQt6%20%7C%20Golang-brightgreen?style=flat-square)
+![Tech](https://img.shields.io/badge/Tech-Python%20%7C%20Golang-brightgreen?style=flat-square)
 ![Status](https://img.shields.io/badge/Status-Beta-yellow?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey?style=flat-square)
 
