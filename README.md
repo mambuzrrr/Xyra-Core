@@ -16,7 +16,7 @@ No more endless terminal commands or juggling FTP tools - **Xyra** brings a mode
 
 **Xyra** is a lightweight **desktop-style dashboard** designed for **VPS users** who mainly work through the **console** and **FTP**. Instead of managing files only through terminal commands or external tools, **Xyra** provides a **visual desktop environment** for browsing, editing, uploading, and organizing server files more comfortably.
 
-The **goal of this project is not to replace the terminal**, but to make remote server management more intuitive and visually accessible — especially for developers who prefer a desktop-like workflow while still working on a VPS.
+The **goal of this project is not to replace the terminal**, but to make remote server management more intuitive and visually accessible - especially for developers who prefer a desktop-like workflow while still working on a VPS.
 
 **Features:**
 - Visual file management with drag-and-drop uploads  
