@@ -32,3 +32,5 @@ Version: Xyra Core v0.9.2 beta
 [Watch on Streamable](https://streamable.com/a0pux1)  
 
 > ⚠️ PS: Sorry for the video quality - Streamable can’t handle 2560x1440.
+
+> ⚠️ This tool is still under active development and is <em>not yet ready for production use</em>. An official release will only happen once Xyra is fully stable and ready.
