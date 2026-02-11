@@ -11,7 +11,7 @@
 ![Status](https://img.shields.io/badge/Status-Beta-yellow?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey?style=flat-square)
 
-🚀 **Take full control of your Linux VPS with a Windows visual desktop!**  
+**Take full control of your Linux VPS with a Windows visual desktop!**  
 No more endless terminal commands or juggling FTP tools - **Xyra** brings a modern, intuitive desktop environment to your server workflow.
 
 **Xyra** is a lightweight **desktop-style dashboard** designed for **VPS users** who mainly work through the **console** and **FTP**. Instead of managing files only through terminal commands or external tools, **Xyra** provides a **visual desktop environment** for browsing, editing, uploading, and organizing server files more comfortably.
