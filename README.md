@@ -1,46 +1,39 @@
 # Xyra
 
-Xyra is a desktop-style Linux/VPS dashboard built with Python and PyQt6.
+![Status](https://img.shields.io/badge/status-beta--v1.3-6ea8ff?style=for-the-badge)
+![Platform](https://img.shields.io/badge/platform-Windows-1f6feb?style=for-the-badge)
+![Remote](https://img.shields.io/badge/remote-SSH%20%2F%20SFTP-2ea043?style=for-the-badge)
 
-It connects to your server over SSH/SFTP and gives you a more visual way to browse folders, manage files, edit text content and open remote assets locally without relying on clunky old workflows.
+Xyra is a desktop-style Linux / VPS dashboard built to make remote file management feel more visual, modern and comfortable.
 
-This release is the current **beta-v1.2** build.
+Instead of jumping between clunky tools, raw file lists and old workflows, Xyra gives you a cleaner space to browse your server, manage files, preview assets and work with remote content in a way that feels much closer to a real desktop environment.
 
-## Features
+## What Xyra Does
 
 - SSH / SFTP based workflow
 - Desktop-style remote file browser
 - Text file editing
-- Drag & drop upload
-- Local opening for external files like images
-- Saved icon positions and UI state
-- Secure local secret storage for SSH passwords
-  - Windows Credential Manager / Keyring first
-  - DPAPI fallback
+- Drag & drop uploads
+- Remote file and folder management
+- In-app previews for supported assets
+- Archive handling and basic server-side file actions
+- Secure local secret storage for server logins
 
-## Why This Exists
+## Why Xyra Exists
 
-Xyra is meant to feel more modern, visual and comfortable than a plain server file list.
+Xyra is meant for people who spend a lot of time inside Linux servers, webroots, dumps, configs, assets or project folders and want something that feels more natural than a plain remote file list.
 
-It is especially useful if you spend a lot of time on Linux servers, webroots, dumps, configs or project folders and want something that feels a bit more like a desktop environment.
+The goal is simple:
 
-## Current State
+- less friction
+- cleaner remote workflows
+- and a more desktop-like experience for server content
 
-This build is already very usable, but it is still a beta.
+## Releases
 
-That means:
+You can find the latest public build notes here:
 
-- the core SSH file workflow is working
-- the UI is already polished enough for daily use
-- there is still room for more cleanup and extra features
-
-## Stack
-
-- Python
-- PyQt6
-- Paramiko
-- QtAwesome
-- Keyring
+- [Releases](../../releases)
 
 ## Run
 
@@ -55,23 +48,6 @@ Start the app:
 ```bash
 python Dashboard.py
 ```
-
-## Main Files
-
-- `Dashboard.py` - main window and startup
-- `editor.py` - text editor window
-- `ssh_backend.py` - SSH/SFTP backend
-- `ui_components.py` - dialogs and UI helpers
-- `storage_utils.py` - config and icon position storage
-- `secret_storage.py` - password protection helpers
-- `path_utils.py` - path and formatting helpers
-- `app_constants.py` - app metadata and constants
-
-## Notes
-
-- Passwords are no longer stored as plain text in `config.json`
-- The app currently focuses on SSH/SFTP file management
-- More terminal-oriented features can be added later
 
 ## Author
 
