@@ -1,0 +1,4 @@
+PyQt6
+paramiko
+qtawesome
+keyring
