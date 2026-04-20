@@ -1,5 +1,7 @@
 import os
 import posixpath
+import shlex
+import stat
 
 from path_utils import normalize_api_path, join_remote_path
 
@@ -90,6 +92,9 @@ class SshRemoteBackend:
             raise RuntimeError("Access outside SSH root is not allowed.")
         return full
 
+    def _is_root_path(self, remote_path: str) -> bool:
+        return normalize_api_path(remote_path) in ("", ".")
+
     def list_dir(self, path: str):
         self._ensure_connected()
         full = self._full_path(path)
@@ -134,6 +139,8 @@ class SshRemoteBackend:
 
     def delete_path(self, remote_path: str):
         self._ensure_connected()
+        if self._is_root_path(remote_path):
+            raise RuntimeError("Refusing to delete the configured SSH root.")
         full = self._full_path(remote_path)
         attrs = self.sftp.stat(full)
         if attrs.st_mode & 0o040000:
@@ -148,6 +155,25 @@ class SshRemoteBackend:
         self._ensure_connected()
         self.sftp.rename(self._full_path(old_path), self._full_path(new_path))
 
+    def copy_path(self, source_path: str, dest_path: str):
+        self._ensure_connected()
+        self._copy_full_path(self._full_path(source_path), self._full_path(dest_path))
+
+    def move_path(self, source_path: str, dest_path: str):
+        self._ensure_connected()
+        if self._is_root_path(source_path):
+            raise RuntimeError("Refusing to move the configured SSH root.")
+        source_full = self._full_path(source_path)
+        dest_full = self._full_path(dest_path)
+        try:
+            self.sftp.rename(source_full, dest_full)
+            return
+        except Exception:
+            pass
+
+        self._copy_full_path(source_full, dest_full)
+        self._delete_full_path(source_full)
+
     def upload_file(self, local_path: str, remote_dir: str):
         self._ensure_connected()
         target_dir = self._full_path(remote_dir)
@@ -161,3 +187,155 @@ class SshRemoteBackend:
 
     def describe(self) -> str:
         return f"SSH {self.username}@{self.host}:{self.port}"
+
+    def get_path_info(self, remote_path: str):
+        self._ensure_connected()
+        full = self._full_path(remote_path)
+        attrs = self.sftp.stat(full)
+        name = posixpath.basename(full.rstrip("/")) or "/"
+        return {
+            "name": name,
+            "path": remote_path,
+            "full_path": full,
+            "isDir": stat.S_ISDIR(attrs.st_mode),
+            "size": int(attrs.st_size),
+            "modTime": int(attrs.st_mtime),
+            "mode": attrs.st_mode,
+            "permissions": stat.filemode(attrs.st_mode),
+            "octal": format(stat.S_IMODE(attrs.st_mode), "03o"),
+        }
+
+    def chmod_path(self, remote_path: str, mode_text: str):
+        self._ensure_connected()
+        mode_text = (mode_text or "").strip()
+        if not mode_text:
+            raise RuntimeError("Permission mode cannot be empty.")
+        if len(mode_text) not in (3, 4) or any(ch not in "01234567" for ch in mode_text):
+            raise RuntimeError("Permission mode must be octal, e.g. 755 or 0644.")
+        mode_value = int(mode_text, 8)
+        self.sftp.chmod(self._full_path(remote_path), mode_value)
+
+    def run_command(self, command: str):
+        self._ensure_connected()
+        stdin, stdout, stderr = self.client.exec_command(command)
+        exit_code = stdout.channel.recv_exit_status()
+        out = stdout.read().decode("utf-8", errors="ignore")
+        err = stderr.read().decode("utf-8", errors="ignore")
+        if exit_code != 0:
+            message = err.strip() or out.strip() or f"Remote command failed with exit code {exit_code}."
+            raise RuntimeError(message)
+        return out
+
+    def extract_archive(self, remote_path: str, dest_dir: str):
+        archive_full = self._full_path(remote_path)
+        dest_full = self._full_path(dest_dir)
+        archive_name = posixpath.basename(archive_full).lower()
+        self._mkdir_full(dest_full)
+
+        quoted_archive = shlex.quote(archive_full)
+        quoted_dest = shlex.quote(dest_full)
+        commands = []
+
+        if archive_name.endswith((".zip", ".pk3", ".iwd", ".jar")):
+            commands = [
+                f"unzip -o {quoted_archive} -d {quoted_dest}",
+                f"bsdtar -xf {quoted_archive} -C {quoted_dest}",
+                f"7z x -y -o{quoted_dest} {quoted_archive}",
+            ]
+        elif archive_name.endswith((".tar.gz", ".tgz")):
+            commands = [f"tar -xzf {quoted_archive} -C {quoted_dest}"]
+        elif archive_name.endswith((".tar.bz2", ".tbz2")):
+            commands = [f"tar -xjf {quoted_archive} -C {quoted_dest}"]
+        elif archive_name.endswith((".tar.xz", ".txz")):
+            commands = [f"tar -xJf {quoted_archive} -C {quoted_dest}"]
+        elif archive_name.endswith(".tar"):
+            commands = [f"tar -xf {quoted_archive} -C {quoted_dest}"]
+        elif archive_name.endswith(".rar"):
+            commands = [
+                f"unrar x -o+ {quoted_archive} {quoted_dest}",
+                f"7z x -y -o{quoted_dest} {quoted_archive}",
+                f"bsdtar -xf {quoted_archive} -C {quoted_dest}",
+            ]
+        elif archive_name.endswith(".7z"):
+            commands = [f"7z x -y -o{quoted_dest} {quoted_archive}"]
+        else:
+            raise RuntimeError("Unsupported archive format.")
+
+        self._run_fallback_commands(commands)
+
+    def compress_to_zip(self, source_path: str, archive_path: str):
+        source_full = self._full_path(source_path)
+        archive_full = self._full_path(archive_path)
+        source_name = posixpath.basename(source_full)
+        source_parent = posixpath.dirname(source_full) or "."
+        archive_parent = posixpath.dirname(archive_full) or "."
+        archive_name = posixpath.basename(archive_full)
+        self._mkdir_full(archive_parent)
+
+        quoted_source_parent = shlex.quote(source_parent)
+        quoted_archive_parent = shlex.quote(archive_parent)
+        quoted_source_name = shlex.quote(source_name)
+        quoted_archive_name = shlex.quote(archive_name)
+
+        commands = [
+            f"cd {quoted_source_parent} && zip -r {quoted_archive_parent}/{quoted_archive_name} {quoted_source_name}",
+            f"cd {quoted_source_parent} && 7z a {quoted_archive_parent}/{quoted_archive_name} {quoted_source_name}",
+            f"cd {quoted_source_parent} && bsdtar -a -cf {quoted_archive_parent}/{quoted_archive_name} {quoted_source_name}",
+        ]
+        self._run_fallback_commands(commands)
+
+    def _copy_full_path(self, source_full: str, dest_full: str):
+        attrs = self.sftp.stat(source_full)
+        if stat.S_ISDIR(attrs.st_mode):
+            self._mkdir_full(dest_full)
+            for entry in self.sftp.listdir_attr(source_full):
+                child_source = posixpath.join(source_full, entry.filename)
+                child_dest = posixpath.join(dest_full, entry.filename)
+                self._copy_full_path(child_source, child_dest)
+            return
+
+        parent = posixpath.dirname(dest_full)
+        if parent:
+            self._mkdir_full(parent)
+        with self.sftp.open(source_full, "rb") as src, self.sftp.open(dest_full, "wb") as dst:
+            while True:
+                chunk = src.read(1024 * 256)
+                if not chunk:
+                    break
+                dst.write(chunk)
+
+    def _delete_full_path(self, full_path: str):
+        attrs = self.sftp.stat(full_path)
+        if stat.S_ISDIR(attrs.st_mode):
+            for item in self.sftp.listdir_attr(full_path):
+                self._delete_full_path(posixpath.join(full_path, item.filename))
+            self.sftp.rmdir(full_path)
+            return
+        self.sftp.remove(full_path)
+
+    def _mkdir_full(self, full_path: str):
+        parts = []
+        cur = full_path
+        while cur not in ("", "/", "."):
+            parts.append(cur)
+            parent = posixpath.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        for part in reversed(parts):
+            try:
+                self.sftp.stat(part)
+            except IOError:
+                self.sftp.mkdir(part)
+
+    def _run_fallback_commands(self, commands):
+        last_error = None
+        for command in commands:
+            try:
+                self.run_command(command)
+                return
+            except Exception as e:
+                last_error = e
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("No archive command available.")

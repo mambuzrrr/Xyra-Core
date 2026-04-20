@@ -1,10 +1,12 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QLineEdit, QLabel,
     QDialogButtonBox, QSpinBox, QGraphicsView, QApplication,
-    QGraphicsRectItem, QGraphicsPixmapItem, QGraphicsTextItem
+    QComboBox, QPushButton, QHBoxLayout,
+    QGraphicsRectItem, QGraphicsPixmapItem, QGraphicsTextItem,
+    QGraphicsScene, QWidget
 )
-from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QAction
+from PyQt6.QtCore import Qt, QTimer, QSize, QRectF
 
 from app_constants import BOX_H, BOX_W, ICON_RENDER_SIZE, TEXT_TOP_GAP
 
@@ -12,9 +14,9 @@ from app_constants import BOX_H, BOX_W, ICON_RENDER_SIZE, TEXT_TOP_GAP
 class SSHLoginDialog(QDialog):
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("SSH Login")
+        self.setWindowTitle("Connect Server")
         self.setModal(True)
-        self.resize(440, 220)
+        self.resize(460, 320)
         self.setStyleSheet("""
             QDialog {
                 background: rgba(12, 16, 24, 0.98);
@@ -55,6 +57,10 @@ class SSHLoginDialog(QDialog):
         form.setVerticalSpacing(10)
         layout.addLayout(form)
 
+        self.profiles = [dict(p) for p in cfg.get("ssh_profiles", []) if isinstance(p, dict)]
+        self.profile_combo = QComboBox()
+        self.profile_name_edit = QLineEdit(cfg.get("ssh_profile_name", ""))
+
         self.host_edit = QLineEdit(cfg.get("ssh_host", ""))
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
@@ -67,12 +73,37 @@ class SSHLoginDialog(QDialog):
         for edit in (self.host_edit, self.user_edit, self.password_edit, self.key_edit, self.root_edit):
             edit.setClearButtonEnabled(True)
 
+        self.profile_combo.addItem("Custom / New profile")
+        selected_profile_name = cfg.get("ssh_profile_name", "")
+        selected_index = 0
+        for idx, profile in enumerate(self.profiles, start=1):
+            name = profile.get("profile_name") or f"Profile {idx}"
+            self.profile_combo.addItem(name)
+            if selected_profile_name and name == selected_profile_name:
+                selected_index = idx
+
+        profile_buttons = QHBoxLayout()
+        self.save_profile_btn = QPushButton("Save profile")
+        self.delete_profile_btn = QPushButton("Delete profile")
+        self.save_profile_btn.clicked.connect(self._save_profile_clicked)
+        self.delete_profile_btn.clicked.connect(self._delete_profile_clicked)
+        profile_buttons.addWidget(self.save_profile_btn)
+        profile_buttons.addWidget(self.delete_profile_btn)
+
+        form.addRow("Profile", self.profile_combo)
+        form.addRow("Profile name", self.profile_name_edit)
+        form.addRow("", self._wrap_layout_widget(profile_buttons))
         form.addRow("Host", self.host_edit)
         form.addRow("Port", self.port_spin)
         form.addRow("Username", self.user_edit)
         form.addRow("Password", self.password_edit)
         form.addRow("Key file (optional)", self.key_edit)
         form.addRow("Remote root", self.root_edit)
+
+        self.profile_combo.currentIndexChanged.connect(self._profile_changed)
+        self.profile_combo.setCurrentIndex(selected_index)
+        if selected_index > 0:
+            self._apply_profile(self.profiles[selected_index - 1])
 
         hint = QLabel("Use password or key file. The dashboard will browse files via SFTP inside the selected remote root.")
         hint.setWordWrap(True)
@@ -83,8 +114,77 @@ class SSHLoginDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _wrap_layout_widget(self, layout):
+        container = QWidget()
+        container.setLayout(layout)
+        return container
+
+    def _current_profile_data(self) -> dict:
+        return {
+            "profile_name": self.profile_name_edit.text().strip(),
+            "ssh_host": self.host_edit.text().strip(),
+            "ssh_port": int(self.port_spin.value()),
+            "ssh_username": self.user_edit.text().strip(),
+            "ssh_password": self.password_edit.text(),
+            "ssh_key_path": self.key_edit.text().strip(),
+            "ssh_root": (self.root_edit.text().strip() or "/root"),
+        }
+
+    def _apply_profile(self, profile: dict):
+        self.profile_name_edit.setText(profile.get("profile_name", ""))
+        self.host_edit.setText(profile.get("ssh_host", ""))
+        self.port_spin.setValue(int(profile.get("ssh_port", 22) or 22))
+        self.user_edit.setText(profile.get("ssh_username", ""))
+        self.password_edit.setText(profile.get("ssh_password", ""))
+        self.key_edit.setText(profile.get("ssh_key_path", ""))
+        self.root_edit.setText(profile.get("ssh_root", "/root"))
+
+    def _profile_changed(self, index: int):
+        if index <= 0:
+            return
+        profile = self.profiles[index - 1]
+        self._apply_profile(profile)
+
+    def _save_profile_clicked(self):
+        profile = self._current_profile_data()
+        name = profile.get("profile_name", "")
+        if not name:
+            return
+        replaced = False
+        for idx, existing in enumerate(self.profiles):
+            if (existing.get("profile_name") or "") == name:
+                self.profiles[idx] = profile
+                replaced = True
+                break
+        if not replaced:
+            self.profiles.append(profile)
+            self.profile_combo.addItem(name)
+        self._refresh_profiles_combo(name)
+
+    def _delete_profile_clicked(self):
+        name = self.profile_name_edit.text().strip()
+        if not name:
+            return
+        self.profiles = [p for p in self.profiles if (p.get("profile_name") or "") != name]
+        self._refresh_profiles_combo("")
+
+    def _refresh_profiles_combo(self, selected_name: str):
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        self.profile_combo.addItem("Custom / New profile")
+        selected_index = 0
+        for idx, profile in enumerate(self.profiles, start=1):
+            name = profile.get("profile_name") or f"Profile {idx}"
+            self.profile_combo.addItem(name)
+            if selected_name and name == selected_name:
+                selected_index = idx
+        self.profile_combo.setCurrentIndex(selected_index)
+        self.profile_combo.blockSignals(False)
+
     def get_data(self) -> dict:
         return {
+            "ssh_profile_name": self.profile_name_edit.text().strip(),
+            "ssh_profiles": self.profiles,
             "ssh_host": self.host_edit.text().strip(),
             "ssh_port": int(self.port_spin.value()),
             "ssh_username": self.user_edit.text().strip(),
@@ -93,6 +193,116 @@ class SSHLoginDialog(QDialog):
             "ssh_root": (self.root_edit.text().strip() or "/root"),
             "connection_mode": "ssh",
         }
+
+
+class ImagePreviewView(QGraphicsView):
+    def __init__(self, scene, parent=None):
+        super().__init__(scene, parent)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        self.setFrameShape(QGraphicsView.Shape.NoFrame)
+        self.setStyleSheet("QGraphicsView { background: rgba(5,8,12,0.96); border: none; }")
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self._zoom = 1.0
+
+    def wheelEvent(self, event):
+        if event.angleDelta().y() > 0:
+            self.scale(1.15, 1.15)
+            self._zoom *= 1.15
+        else:
+            self.scale(1 / 1.15, 1 / 1.15)
+            self._zoom /= 1.15
+
+
+class ImagePreviewDialog(QDialog):
+    def __init__(self, image_path: str, display_name: str, open_external_cb=None, parent=None):
+        super().__init__(parent)
+        self.image_path = image_path
+        self.display_name = display_name
+        self.open_external_cb = open_external_cb
+        self.setWindowTitle(f"Preview - {display_name}")
+        self.resize(1100, 780)
+        self.setStyleSheet("""
+            QDialog {
+                background: rgba(10,14,20,0.98);
+                color: #eef3f9;
+            }
+            QLabel {
+                color: #eef3f9;
+            }
+            QPushButton {
+                background: rgba(255,255,255,0.08);
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 10px;
+                padding: 8px 14px;
+                color: #eef3f9;
+                min-width: 90px;
+            }
+            QPushButton:hover {
+                background: rgba(110,168,255,0.16);
+                border: 1px solid rgba(110,168,255,0.34);
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        header = QHBoxLayout()
+        self.title_label = QLabel(display_name)
+        self.info_label = QLabel("")
+        self.info_label.setStyleSheet("color: rgba(255,255,255,0.70);")
+        header.addWidget(self.title_label)
+        header.addStretch()
+        header.addWidget(self.info_label)
+        layout.addLayout(header)
+
+        self.scene = QGraphicsScene(self)
+        self.view = ImagePreviewView(self.scene, self)
+        layout.addWidget(self.view, 1)
+
+        buttons = QHBoxLayout()
+        self.fit_btn = QPushButton("Fit")
+        self.actual_btn = QPushButton("100%")
+        self.external_btn = QPushButton("Open externally")
+        self.close_btn = QPushButton("Close")
+        self.fit_btn.clicked.connect(self.fit_image)
+        self.actual_btn.clicked.connect(self.show_actual_size)
+        self.external_btn.clicked.connect(self.open_external)
+        self.close_btn.clicked.connect(self.accept)
+        buttons.addWidget(self.fit_btn)
+        buttons.addWidget(self.actual_btn)
+        buttons.addWidget(self.external_btn)
+        buttons.addStretch()
+        buttons.addWidget(self.close_btn)
+        layout.addLayout(buttons)
+
+        self.pixmap = QPixmap(image_path)
+        self.pix_item = QGraphicsPixmapItem(self.pixmap)
+        self.scene.addItem(self.pix_item)
+        self.scene.setSceneRect(QRectF(self.pixmap.rect()))
+        self.info_label.setText(f"{self.pixmap.width()} x {self.pixmap.height()}")
+        QTimer.singleShot(0, self.fit_image)
+
+    def fit_image(self):
+        if self.pixmap.isNull():
+            return
+        self.view.resetTransform()
+        self.view.fitInView(self.pix_item, Qt.AspectRatioMode.KeepAspectRatio)
+        self.view._zoom = 1.0
+
+    def show_actual_size(self):
+        self.view.resetTransform()
+        self.view._zoom = 1.0
+
+    def open_external(self):
+        if callable(self.open_external_cb):
+            self.open_external_cb(self.image_path)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self.fit_image)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if abs(self.view._zoom - 1.0) < 0.001:
+            QTimer.singleShot(0, self.fit_image)
 
 
 class DropGraphicsView(QGraphicsView):
