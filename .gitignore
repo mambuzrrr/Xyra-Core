@@ -23,6 +23,8 @@ icons_pos.json
 *.db
 *.sqlite
 *.sqlite3
+app.manifest
+!app.manifest
 
 build/
 dist/

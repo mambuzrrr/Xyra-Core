@@ -8,7 +8,6 @@ datas = []
 datas += qtawesome_datas
 datas += [
     ("assets", "assets"),
-    ("icons", "icons"),
 ]
 
 binaries = []
@@ -52,6 +51,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=["assets/app.ico"],
+    icon=["assets/xyra.ico"],
+    version="version_info.txt",
+    manifest="app.manifest",
     onefile=True,
 )

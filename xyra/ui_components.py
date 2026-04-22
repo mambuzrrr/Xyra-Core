@@ -3,12 +3,12 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QSpinBox, QGraphicsView, QApplication,
     QComboBox, QPushButton, QHBoxLayout,
     QGraphicsRectItem, QGraphicsPixmapItem, QGraphicsTextItem,
-    QGraphicsScene, QWidget
+    QGraphicsScene, QWidget, QMessageBox
 )
-from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QAction
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QAction, QBrush
 from PyQt6.QtCore import Qt, QTimer, QSize, QRectF
 
-from app_constants import BOX_H, BOX_W, ICON_RENDER_SIZE, TEXT_TOP_GAP
+from xyra.app_constants import BOX_H, BOX_W, ICON_RENDER_SIZE, TEXT_TOP_GAP
 
 
 class SSHLoginDialog(QDialog):
@@ -149,16 +149,12 @@ class SSHLoginDialog(QDialog):
         profile = self._current_profile_data()
         name = profile.get("profile_name", "")
         if not name:
+            QMessageBox.warning(self, "Save profile", "Please enter a profile name first.")
             return
-        replaced = False
-        for idx, existing in enumerate(self.profiles):
-            if (existing.get("profile_name") or "") == name:
-                self.profiles[idx] = profile
-                replaced = True
-                break
-        if not replaced:
-            self.profiles.append(profile)
-            self.profile_combo.addItem(name)
+        if not profile.get("ssh_host") or not profile.get("ssh_username"):
+            QMessageBox.warning(self, "Save profile", "Host and username are required before saving a profile.")
+            return
+        self._upsert_profile(profile)
         self._refresh_profiles_combo(name)
 
     def _delete_profile_clicked(self):
@@ -180,6 +176,25 @@ class SSHLoginDialog(QDialog):
                 selected_index = idx
         self.profile_combo.setCurrentIndex(selected_index)
         self.profile_combo.blockSignals(False)
+
+    def _upsert_profile(self, profile: dict):
+        name = (profile.get("profile_name") or "").strip()
+        if not name:
+            return
+        for idx, existing in enumerate(self.profiles):
+            if (existing.get("profile_name") or "") == name:
+                self.profiles[idx] = profile
+                return
+        self.profiles.append(profile)
+
+    def accept(self):
+        profile = self._current_profile_data()
+        if not profile.get("ssh_host") or not profile.get("ssh_username"):
+            QMessageBox.warning(self, "Connect Server", "SSH host and username are required.")
+            return
+        if profile.get("profile_name"):
+            self._upsert_profile(profile)
+        super().accept()
 
     def get_data(self) -> dict:
         return {
@@ -370,6 +385,17 @@ class DropGraphicsView(QGraphicsView):
 
         super().contextMenuEvent(event)
 
+    def mousePressEvent(self, event):
+        p = self.parent()
+        item = self.itemAt(event.pos())
+        icon_item = item if isinstance(item, IconItem) else getattr(item, "parentItem", lambda: None)()
+
+        if icon_item is None and event.button() == Qt.MouseButton.LeftButton:
+            if p and hasattr(p, "_clear_icon_selection"):
+                p._clear_icon_selection()
+
+        super().mousePressEvent(event)
+
 
 class IconItem(QGraphicsRectItem):
     def __init__(self, pixmap: QPixmap, name: str, is_dir: bool, parent=None):
@@ -381,6 +407,7 @@ class IconItem(QGraphicsRectItem):
         self._base_scale = 1.0
         self._scale_factor = 1.0
         self._target_factor = 1.0
+        self._hovered = False
 
         self.setRect(0, 0, BOX_W, BOX_H)
         self.setPen(QPen(Qt.PenStyle.NoPen))
@@ -418,9 +445,41 @@ class IconItem(QGraphicsRectItem):
         self._timer.setInterval(15)
         self._timer.timeout.connect(self._step)
 
-        self._base_font_pt = 9
+        self._base_font_pt = 10
         self._icon_h_for_text = icon_h
+        self._highlight_rect = QRectF(18, 4, BOX_W - 36, BOX_H - 12)
         self._update_label_text(display_name=name, scale_factor=1.0)
+
+    def _calculate_highlight_rect(self) -> QRectF:
+        pix_rect = self.pix_item.mapRectToParent(self.pix_item.boundingRect())
+        text_rect = self.text_item.mapRectToParent(self.text_item.boundingRect())
+        combined = pix_rect.united(text_rect)
+
+        pad_x = 12
+        pad_y = 8
+        width = min(BOX_W - 12, max(76, combined.width() + pad_x * 2))
+        height = min(BOX_H - 8, max(74, combined.height() + pad_y * 2))
+        x = max(6, (BOX_W - width) / 2)
+        y = max(3, combined.top() - pad_y)
+        if y + height > BOX_H - 4:
+            y = max(3, BOX_H - height - 4)
+        return QRectF(x, y, width, height)
+
+    def paint(self, painter, option, widget=None):
+        option.state &= ~option.state.State_Selected
+        option.state &= ~option.state.State_HasFocus
+
+        if self.isSelected() or self._hovered:
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            bg = QColor(110, 168, 255, 46 if self.isSelected() else 22)
+            border = QColor(110, 168, 255, 150 if self.isSelected() else 70)
+            painter.setBrush(QBrush(bg))
+            painter.setPen(QPen(border, 1.4 if self.isSelected() else 1.0))
+            painter.drawRoundedRect(self._highlight_rect, 12, 12)
+            painter.restore()
+
+        super().paint(painter, option, widget)
 
     def setBaseScale(self, s: float):
         self._base_scale = max(0.05, float(s))
@@ -444,28 +503,38 @@ class IconItem(QGraphicsRectItem):
     def _update_label_text(self, display_name: str, scale_factor: float):
         self._display_name = display_name
 
-        pt = max(8, int(round(self._base_font_pt * max(0.55, scale_factor))))
-        f = QFont("Arial", pt)
+        pt = max(9, int(round(self._base_font_pt * max(0.62, scale_factor))))
+        f = QFont("Segoe UI Variable Text", pt)
+        f.setWeight(QFont.Weight.DemiBold)
         self.text_item.setFont(f)
 
         safe = (display_name or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        self.text_item.setHtml(f"<div align='center' style='line-height:1.05'>{safe}</div>")
+        self.text_item.setHtml(
+            f"<div align='center' style='line-height:1.12; font-weight:650; color:#f6f9ff'>{safe}</div>"
+        )
 
         self.text_item.setPos(0, self._icon_h_for_text + TEXT_TOP_GAP)
+        self._highlight_rect = self._calculate_highlight_rect()
 
     def hoverEnterEvent(self, event):
-        self._target_factor = 1.10
-        if not self._timer.isActive():
-            self._timer.start()
+        self._hovered = True
+        self.update()
         self.setZValue(50)
         super().hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event):
-        self._target_factor = 1.0
-        if not self._timer.isActive():
-            self._timer.start()
+        self._hovered = False
+        self.update()
         self.setZValue(0)
         super().hoverLeaveEvent(event)
+
+    def mousePressEvent(self, event):
+        modifiers = event.modifiers()
+        parent = self.scene().parent
+        super().mousePressEvent(event)
+        if parent and hasattr(parent, "_select_icon_by_name"):
+            additive = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+            QTimer.singleShot(0, lambda: parent._select_icon_by_name(self.name, additive=additive))
 
     def mouseDoubleClickEvent(self, event):
         modifiers = QApplication.keyboardModifiers()

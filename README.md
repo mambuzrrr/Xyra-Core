@@ -1,6 +1,6 @@
 # Xyra
 
-![Status](https://img.shields.io/badge/status-beta--v1.4-6ea8ff?style=for-the-badge)
+![Status](https://img.shields.io/badge/status-1.6-6ea8ff?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/platform-Windows-1f6feb?style=for-the-badge)
 ![Remote](https://img.shields.io/badge/remote-SSH%20%2F%20SFTP-2ea043?style=for-the-badge)
 

@@ -2,8 +2,9 @@ import os
 import posixpath
 import shlex
 import stat
+from datetime import datetime
 
-from path_utils import normalize_api_path, join_remote_path
+from xyra.path_utils import normalize_api_path, join_remote_path
 
 try:
     import paramiko
@@ -108,6 +109,59 @@ class SshRemoteBackend:
             })
         return result
 
+    def search_files(self, start_path: str, query: str, max_depth: int = 4, max_results: int = 250, cancel_callback=None):
+        self._ensure_connected()
+        query = (query or "").strip().lower()
+        if not query:
+            return []
+
+        start_norm = normalize_api_path(start_path)
+        start_full = self._full_path(start_norm)
+        results = []
+        skip_dirs = {".git", "__pycache__", ".xyra-trash", ".xyra-backups"}
+
+        def rel_join(base: str, child: str) -> str:
+            if base in ("", "."):
+                return normalize_api_path(child)
+            return normalize_api_path(posixpath.join(base, child))
+
+        def walk(rel_path: str, full_path: str, depth: int):
+            if cancel_callback and cancel_callback():
+                raise RuntimeError("Search cancelled.")
+            if len(results) >= max_results:
+                return
+            try:
+                entries = self.sftp.listdir_attr(full_path)
+            except Exception:
+                return
+
+            for entry in entries:
+                if cancel_callback and cancel_callback():
+                    raise RuntimeError("Search cancelled.")
+                if len(results) >= max_results:
+                    return
+
+                name = entry.filename
+                child_rel = rel_join(rel_path, name)
+                is_dir = stat.S_ISDIR(entry.st_mode)
+
+                if query in name.lower():
+                    parent = normalize_api_path(rel_path)
+                    results.append({
+                        "name": name,
+                        "path": child_rel,
+                        "parent": parent,
+                        "isDir": is_dir,
+                        "size": int(entry.st_size),
+                        "modTime": int(entry.st_mtime),
+                    })
+
+                if is_dir and depth < max_depth and name not in skip_dirs:
+                    walk(child_rel, posixpath.join(full_path, name), depth + 1)
+
+        walk(start_norm, start_full, 0)
+        return results
+
     def read_bytes(self, remote_path: str) -> bytes:
         self._ensure_connected()
         full = self._full_path(remote_path)
@@ -150,6 +204,56 @@ class SshRemoteBackend:
             self.sftp.rmdir(full)
         else:
             self.sftp.remove(full)
+
+    def trash_path(self, remote_path: str) -> str:
+        self._ensure_connected()
+        if self._is_root_path(remote_path):
+            raise RuntimeError("Refusing to trash the configured SSH root.")
+
+        source_norm = normalize_api_path(remote_path)
+        if source_norm == ".xyra-trash" or source_norm.startswith(".xyra-trash/"):
+            raise RuntimeError("Items already inside .xyra-trash must be deleted permanently.")
+
+        source_full = self._full_path(source_norm)
+        self.sftp.stat(source_full)
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        trash_path = normalize_api_path(posixpath.join(".xyra-trash", timestamp, source_norm))
+        trash_full = self._full_path(trash_path)
+        trash_parent = posixpath.dirname(trash_full)
+        if trash_parent:
+            self._mkdir_full(trash_parent)
+
+        try:
+            self.sftp.rename(source_full, trash_full)
+        except Exception:
+            self._copy_full_path(source_full, trash_full)
+            self._delete_full_path(source_full)
+
+        return trash_path
+
+    def backup_file(self, remote_path: str) -> str:
+        self._ensure_connected()
+        source_norm = normalize_api_path(remote_path)
+        if self._is_root_path(source_norm):
+            raise RuntimeError("Refusing to back up the configured SSH root.")
+        if source_norm.startswith(".xyra-backups/") or source_norm.startswith(".xyra-trash/"):
+            raise RuntimeError("Refusing to back up internal Xyra state folders.")
+
+        source_full = self._full_path(source_norm)
+        attrs = self.sftp.stat(source_full)
+        if stat.S_ISDIR(attrs.st_mode):
+            raise RuntimeError("Only files can be backed up before editing.")
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = normalize_api_path(posixpath.join(".xyra-backups", timestamp, source_norm))
+        backup_full = self._full_path(backup_path)
+        backup_parent = posixpath.dirname(backup_full)
+        if backup_parent:
+            self._mkdir_full(backup_parent)
+
+        self._copy_full_path(source_full, backup_full)
+        return backup_path
 
     def rename(self, old_path: str, new_path: str):
         self._ensure_connected()
@@ -225,6 +329,27 @@ class SshRemoteBackend:
             message = err.strip() or out.strip() or f"Remote command failed with exit code {exit_code}."
             raise RuntimeError(message)
         return out
+
+    def get_server_health(self, current_path: str = "."):
+        self._ensure_connected()
+        target_full = shlex.quote(self._full_path(current_path))
+        root_full = shlex.quote(self._full_path("."))
+        command = (
+            "printf 'Host: '; hostname 2>/dev/null || true; "
+            "printf 'User: '; whoami 2>/dev/null || true; "
+            "printf 'SSH root: '; pwd 2>/dev/null || true; "
+            f"printf 'Xyra path: '; printf '%s\\n' {target_full}; "
+            "printf 'Load: '; awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null || true; "
+            "printf 'Memory: '; free -h 2>/dev/null | awk '/^Mem:/ {print $3 \" / \" $2 \" used\"}' || true; "
+            "printf '\\nDisk for current path:\\n'; "
+            f"df -h {target_full} 2>&1 || true; "
+            "printf '\\nDisk for SSH root:\\n'; "
+            f"df -h {root_full} 2>&1 || true; "
+            "printf '\\nUptime:\\n'; uptime 2>&1 || true; "
+            "printf '\\nSystem:\\n'; uname -a 2>&1 || true; "
+            "true"
+        )
+        return self.run_command(command).strip()
 
     def extract_archive(self, remote_path: str, dest_dir: str):
         archive_full = self._full_path(remote_path)

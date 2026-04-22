@@ -3,12 +3,13 @@ import json
 import os
 import sqlite3
 
-from app_constants import CONFIG_FILE, GUI_CONFIG_FILE, ICONS_POS_FILE, STATE_DB_FILE
-from secret_storage import clear_password, load_password, save_password
+from xyra.app_constants import CONFIG_FILE, GUI_CONFIG_FILE, ICONS_POS_FILE, STATE_DB_FILE
+from xyra.secret_storage import clear_password, load_password, save_password
 
 
 GUI_DEFAULTS = {
     "background": "",
+    "icon_pack_path": "",
     "window_width": 1600,
     "window_height": 900,
     "show_favorites_only": False,
@@ -76,6 +77,16 @@ def save_recent_paths(paths):
         print("Cannot save recent paths:", e)
 
 
+def save_favorites(paths):
+    try:
+        with _state_db() as con:
+            _init_state_db(con)
+            _state_set(con, "favorites", json.dumps(paths or []))
+            con.commit()
+    except Exception as e:
+        print("Cannot save favorites:", e)
+
+
 def load_icons_pos():
     try:
         with _state_db() as con:
@@ -115,6 +126,7 @@ def save_icons_pos(data):
 def _load_gui_config():
     cfg = {
         "background": GUI_DEFAULTS["background"],
+        "icon_pack_path": GUI_DEFAULTS["icon_pack_path"],
         "window_size": [GUI_DEFAULTS["window_width"], GUI_DEFAULTS["window_height"]],
         "show_favorites_only": GUI_DEFAULTS["show_favorites_only"],
     }
@@ -131,6 +143,7 @@ def _load_gui_config():
             cfg["window_size"] = [max(200, width), max(200, height)]
         if parser.has_section("display"):
             cfg["background"] = parser.get("display", "background", fallback=GUI_DEFAULTS["background"])
+            cfg["icon_pack_path"] = parser.get("display", "icon_pack_path", fallback=GUI_DEFAULTS["icon_pack_path"])
         if parser.has_section("view"):
             cfg["show_favorites_only"] = parser.getboolean(
                 "view",
@@ -148,6 +161,9 @@ def _load_gui_config():
                 bg = legacy.get("background")
                 if isinstance(bg, str):
                     cfg["background"] = bg
+                icon_pack_path = legacy.get("icon_pack_path")
+                if isinstance(icon_pack_path, str):
+                    cfg["icon_pack_path"] = icon_pack_path
                 ws = legacy.get("window_size")
                 if isinstance(ws, (list, tuple)) and len(ws) == 2:
                     cfg["window_size"] = [max(200, int(ws[0])), max(200, int(ws[1]))]
@@ -175,6 +191,7 @@ def _save_gui_config(cfg: dict):
     }
     parser["display"] = {
         "background": str(cfg.get("background") or ""),
+        "icon_pack_path": str(cfg.get("icon_pack_path") or ""),
     }
     parser["view"] = {
         "show_favorites_only": "true" if cfg.get("show_favorites_only") else "false",
@@ -397,7 +414,8 @@ def _load_profiles_from_db(con):
             "secret_key": row[7] or "",
             "ssh_password_enc": row[8] or "",
         }
-        profiles.append(_load_profile(profile))
+        if profile["ssh_host"] and profile["ssh_username"]:
+            profiles.append(_load_profile(profile))
     return profiles
 
 
@@ -414,6 +432,8 @@ def _save_profiles_to_db(con, profiles):
         saved = _save_profile(profile)
         profile_name = (saved.get("profile_name") or saved.get("ssh_host") or "").strip()
         if not profile_name or profile_name in seen:
+            continue
+        if not (saved.get("ssh_host") or "").strip() or not (saved.get("ssh_username") or "").strip():
             continue
         seen.add(profile_name)
         normalized_profiles.append(saved)
