@@ -4,123 +4,88 @@
 import sys
 import os
 import tempfile
-import math
 import subprocess
 import threading
-import hashlib
+import time
+from contextlib import nullcontext
 from datetime import datetime
+from typing import cast
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsScene,
     QToolBar, QFileDialog,
     QToolButton, QMenu, QLabel, QMessageBox, QLineEdit,
-    QDialog, QVBoxLayout, QHBoxLayout, QWidget, QSizePolicy,
-    QInputDialog, QFormLayout, QDialogButtonBox, QSpinBox,
-    QListWidget, QListWidgetItem, QPlainTextEdit
+    QDialog, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QHBoxLayout, QWidget,
+    QSizePolicy, QTabBar,
 )
 from PyQt6.QtGui import (
-    QPixmap, QFont, QIcon, QAction, QKeySequence, QShortcut, QPainter,
-    QPen, QColor
+    QCloseEvent, QColor, QKeyEvent, QPixmap, QFont, QIcon, QAction, QKeySequence,
+    QResizeEvent, QShortcut,
 )
 from PyQt6.QtCore import (
-    Qt, QTimer, QRectF, QPoint, QPointF,
-    QEasingCurve, QPropertyAnimation, QSize, pyqtSignal
+    Qt, QTimer, QPoint, QRect, QSize, QThread, pyqtSignal,
 )
 
-from xyra.editor import TextEditorWindow
 from xyra.app_constants import (
-    APP_NAME, APP_VERSION, APP_WEBSITE, APP_DEVELOPER, APP_CONTRIBUTORS,
-    APP_LOGO_PATH, APP_ICON_PATH, TEXT_EXTS, resource_path
+    APP_NAME, APP_VERSION, APP_LOGO_PATH, APP_ICON_PATH,
 )
-from xyra.storage_utils import load_config, save_config, save_favorites, save_recent_paths, load_icons_pos, save_icons_pos
-from xyra.path_utils import (
-    split_ext, mb_size, normalize_api_path,
-    join_server_path, join_remote_path, is_valid_new_name
+from xyra.storage_utils import (
+    load_config, load_icons_pos, save_config, save_favorites, save_recent_paths,
+    save_server_workspace,
 )
+from xyra.path_utils import normalize_api_path
 from xyra.ssh_backend import SshRemoteBackend
-from xyra.ui_components import SSHLoginDialog, DropGraphicsView, IconItem, ImagePreviewDialog
+from xyra.discord_rpc import DiscordRichPresence
+from xyra.ui_components import SSHLoginDialog, DropGraphicsView
+from xyra.application import apply_window_chrome, create_application
+from xyra.dashboard_search import DashboardSearchMixin
+from xyra.dashboard_transfers import DashboardTransfersMixin
+from xyra.dashboard_visuals import DashboardVisualsMixin
+from xyra.dashboard_files import DashboardFilesMixin
+from xyra.dashboard_editing import DashboardEditingMixin
+from xyra.dashboard_updates import DashboardUpdatesMixin
+from xyra.transfer_queue import TransferQueue
+from xyra.server_profiles import (
+    active_profile_data, clean_workspace, profile_accent, profile_display_name,
+    profile_identity,
+)
+from xyra.theme import (
+    CENTER_MESSAGE_STYLE, OFFLINE_PILL_STYLE,
+    OVERLAY_STYLE, SERVER_BAR_STYLE, TASKBAR_STYLE, TOAST_STYLE, TOOLBAR_STYLE,
+)
 
 try:
     import qtawesome as qta
 except Exception:
     qta = None
 
-if sys.platform.startswith("win"):
-    try:
-        import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Brejax.Xyra.Core")
-    except Exception:
-        pass
-
-app = QApplication(sys.argv)
-app_font = QFont("Segoe UI Variable Text")
-app_font.setPointSizeF(10.5)
-app.setFont(app_font)
-
-if os.path.exists(APP_ICON_PATH):
-    app.setWindowIcon(QIcon(APP_ICON_PATH))
-
-app.setStyleSheet("""
-    QWidget {
-        font-family: "Segoe UI Variable Text", "Segoe UI";
-        font-size: 10.5pt;
-    }
-    QToolTip {
-        background: rgba(18,22,30,0.96);
-        color: #f2f6fb;
-        border: 1px solid rgba(255,255,255,0.10);
-        padding: 6px 8px;
-    }
-    QScrollBar:vertical {
-        background: rgba(8,10,14,0.18);
-        width: 14px;
-        margin: 8px 4px 8px 0px;
-        border: none;
-        border-radius: 7px;
-    }
-    QScrollBar::handle:vertical {
-        background: rgba(170, 190, 215, 0.42);
-        min-height: 36px;
-        border-radius: 7px;
-    }
-    QScrollBar::handle:vertical:hover {
-        background: rgba(110,168,255,0.62);
-    }
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
-    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-        background: transparent;
-        height: 0px;
-    }
-    QScrollBar:horizontal {
-        background: rgba(8,10,14,0.18);
-        height: 14px;
-        margin: 0px 8px 4px 8px;
-        border: none;
-        border-radius: 7px;
-    }
-    QScrollBar::handle:horizontal {
-        background: rgba(170, 190, 215, 0.42);
-        min-width: 36px;
-        border-radius: 7px;
-    }
-    QScrollBar::handle:horizontal:hover {
-        background: rgba(110,168,255,0.62);
-    }
-    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal,
-    QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
-        background: transparent;
-        width: 0px;
-    }
-""")
-
-class RemoteDesktop(QMainWindow):
+class RemoteDesktop(
+    DashboardUpdatesMixin,
+    DashboardSearchMixin,
+    DashboardTransfersMixin,
+    DashboardVisualsMixin,
+    DashboardFilesMixin,
+    DashboardEditingMixin,
+    QMainWindow,
+):
     preview_ready = pyqtSignal(str, str)
+    file_open_failed = pyqtSignal(str, str)
     remote_job_done = pyqtSignal(str)
     remote_job_failed = pyqtSignal(str, str, str)
     remote_search_done = pyqtSignal(int, str, list)
     remote_search_failed = pyqtSignal(int, str)
     server_health_done = pyqtSignal(str)
     server_health_failed = pyqtSignal(str)
+    checksum_done = pyqtSignal(str, dict)
+    checksum_failed = pyqtSignal(str, str)
+    folder_load_done = pyqtSignal(int, str, object, object)
+    folder_load_failed = pyqtSignal(int, str, str)
+    connection_state_changed = pyqtSignal(str, str)
+    update_check_done = pyqtSignal(object, bool)
+    update_check_failed = pyqtSignal(str, bool)
+    update_download_progress = pyqtSignal(int, int)
+    update_download_done = pyqtSignal(str, object)
+    update_download_failed = pyqtSignal(str)
     ARCHIVE_EXTS = (
         ".zip", ".pk3", ".iwd", ".jar", ".tar", ".tar.gz", ".tgz",
         ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".rar", ".7z",
@@ -131,7 +96,7 @@ class RemoteDesktop(QMainWindow):
         if qta is None:
             return QIcon()
         try:
-            return qta.icon(name, color=color)
+            return cast(QIcon, qta.icon(name, color=color))
         except Exception:
             return QIcon()
 
@@ -142,7 +107,7 @@ class RemoteDesktop(QMainWindow):
 
     def _style_toolbar_action_button(self, action: QAction, *, icon_only: bool = True):
         btn = self.toolbar.widgetForAction(action)
-        if btn is None:
+        if not isinstance(btn, QToolButton):
             return
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         if icon_only:
@@ -152,7 +117,7 @@ class RemoteDesktop(QMainWindow):
             btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             btn.setMinimumHeight(40)
 
-    def __init__(self):
+    def __init__(self, launch_profile_name: str = ""):
         super().__init__()
 
         if os.path.exists(APP_ICON_PATH):
@@ -161,12 +126,30 @@ class RemoteDesktop(QMainWindow):
         self.T = self._make_strings()
 
         self.cfg = load_config()
+        if launch_profile_name:
+            selected = next(
+                (
+                    profile for profile in self.cfg.get("ssh_profiles", [])
+                    if isinstance(profile, dict)
+                    and profile_display_name(profile).casefold() == launch_profile_name.casefold()
+                ),
+                None,
+            )
+            if selected:
+                self.cfg.update(active_profile_data(selected))
+                self.cfg["connection_mode"] = "ssh"
         if self.cfg.pop("_migrate_secret_storage", False) or self.cfg.pop("_migrate_storage_layout", False):
             save_config(self.cfg)
         self.icons_pos = load_icons_pos()
-        self.backend = None
+        self.backend: SshRemoteBackend | None = None
+        self._exit_shutdown_done = False
+        self._server_tab_sessions = []
+        self._server_session_serial = 0
+        self._active_server_session_id = None
+        self._dismissed_server_identities = set()
 
         self.item_by_name = {}
+        self._entry_by_name = {}
         self.current_order = []
         self.current_items = []
         self.selected_names = set()
@@ -182,63 +165,95 @@ class RemoteDesktop(QMainWindow):
         self._remote_search_active = False
         self._remote_search_cancel_requested = False
         self._remote_search_id = 0
+        self._checksum_widgets = {}
+        self.discord_rpc = DiscordRichPresence()
+        self.transfer_queue = TransferQueue(self, max_active=1)
+        self.transfer_center = None
+        self._setup_updates()
 
         # Search/filter state
         self.search_query = ""
         self.last_load_error = ""
+        self._folder_load_generation = 0
+        self._folder_load_lock = threading.Lock()
+        self._folder_loading_path = None
+        self._reconnect_lock = threading.Lock()
         self._search_timer = QTimer()
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(120)
         self._search_timer.timeout.connect(self._rerender_current_folder)
+        self._type_select_buffer = ""
+        self._type_select_timer = QTimer()
+        self._type_select_timer.setSingleShot(True)
+        self._type_select_timer.setInterval(900)
+        self._type_select_timer.timeout.connect(self._reset_type_select_buffer)
 
         self.bg_path = None
         self.bg_pixmap = QPixmap()
+        self.bg_movie = None
         self._did_first_show = False
 
         self._relayout_timer = QTimer()
         self._relayout_timer.setSingleShot(True)
-        self._relayout_timer.setInterval(80)
-        self._relayout_timer.timeout.connect(self._rerender_current_folder)
+        self._relayout_timer.setInterval(110)
+        self._relayout_timer.timeout.connect(self._relayout_current_items)
+
+        self._background_resize_timer = QTimer()
+        self._background_resize_timer.setSingleShot(True)
+        self._background_resize_timer.setInterval(140)
+        self._background_resize_timer.timeout.connect(self._update_background_pixmap)
+
+        self._window_size_save_timer = QTimer()
+        self._window_size_save_timer.setSingleShot(True)
+        self._window_size_save_timer.setInterval(350)
+        self._window_size_save_timer.timeout.connect(self._save_window_size)
+        self._window_geometry_ready = False
         self.preview_ready.connect(self._show_image_preview_dialog)
+        self.file_open_failed.connect(self._show_file_open_error)
         self.remote_job_done.connect(self._finish_remote_job_success)
         self.remote_job_failed.connect(self._finish_remote_job_error)
         self.remote_search_done.connect(self._show_remote_search_results)
         self.remote_search_failed.connect(self._finish_remote_search_error)
         self.server_health_done.connect(self._show_server_health_dialog)
         self.server_health_failed.connect(self._finish_server_health_error)
+        self.checksum_done.connect(self._finish_checksum_success)
+        self.checksum_failed.connect(self._finish_checksum_error)
+        self.folder_load_done.connect(self._finish_folder_load)
+        self.folder_load_failed.connect(self._fail_folder_load)
+        self.connection_state_changed.connect(self._handle_connection_state)
+        self.transfer_queue.jobs_changed.connect(self._handle_transfer_jobs_changed)
+        self.transfer_queue.job_finished.connect(self._handle_transfer_job_finished)
 
         self.setWindowTitle(APP_NAME)
+        apply_window_chrome(self)
 
-        self.scene = QGraphicsScene()
-        self.scene.parent = self
+        self.scene = QGraphicsScene(self)
+        self.scene.dashboard_owner = self
         self.view = DropGraphicsView(self.scene, self)
         self.setCentralWidget(self.view)
 
         self.drop_overlay = QLabel(self.T["drop_hint"], self.view.viewport())
         self.drop_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.drop_overlay.setStyleSheet(
-            "QLabel { background: rgba(0,0,0,0.65); color: white; font-size: 24px; "
-            "border-radius: 18px; padding: 18px; }"
+            "QLabel { background: rgba(31, 66, 104, 0.92); color: #f4f8ff; "
+            "font-size: 17px; font-weight: 700; border: 2px dashed #d8c39a; "
+            "border-radius: 20px; padding: 24px; }"
         )
         self.drop_overlay.hide()
 
         self.upload_overlay = QLabel("", self.view.viewport())
         self.upload_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.upload_overlay.setStyleSheet(
-            "QLabel { background: rgba(20,20,20,0.78); color: white; font-size: 18px; "
-            "border-radius: 16px; padding: 16px 22px; }"
-        )
+        self.upload_overlay.setStyleSheet(OVERLAY_STYLE)
         self.upload_overlay.hide()
 
         self.search_cancel_button = QToolButton(self.view.viewport())
         self.search_cancel_button.setText("Cancel")
         self.search_cancel_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.search_cancel_button.setStyleSheet(
-            "QToolButton { background: rgba(255,255,255,0.10); color: #f4f7fb; "
-            "border: 1px solid rgba(255,255,255,0.16); border-radius: 11px; "
-            "padding: 8px 18px; font-weight: 700; } "
-            "QToolButton:hover { background: rgba(244,199,107,0.22); border-color: rgba(244,199,107,0.55); } "
-            "QToolButton:pressed { background: rgba(244,199,107,0.32); }"
+            "QToolButton { background: #1c1c1f; color: #dedbd5; border: 1px solid #353538; "
+            "border-radius: 10px; padding: 8px 18px; font-weight: 650; } "
+            "QToolButton:hover { background: #29292c; border-color: #57534d; } "
+            "QToolButton:pressed { background: #141416; }"
         )
         self.search_cancel_button.clicked.connect(self.cancel_remote_search)
         self.search_cancel_button.hide()
@@ -246,10 +261,14 @@ class RemoteDesktop(QMainWindow):
         self.center_message = QLabel("", self.view.viewport())
         self.center_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.center_message.setWordWrap(True)
-        self.center_message.setStyleSheet(
-            "QLabel { background: rgba(8,12,18,0.76); color: #f5f7fb; font-size: 18px; "
-            "border: 1px solid rgba(255,255,255,0.10); border-radius: 20px; padding: 18px 24px; }"
-        )
+        self.center_message.setTextFormat(Qt.TextFormat.RichText)
+        self.center_message.setStyleSheet(CENTER_MESSAGE_STYLE)
+        center_shadow = QGraphicsDropShadowEffect(self.center_message)
+        center_shadow.setBlurRadius(34)
+        center_shadow.setOffset(0, 12)
+        center_shadow.setColor(QColor(0, 0, 0, 125))
+        self.center_message.setGraphicsEffect(center_shadow)
+        self._center_message_source = ""
         self.center_message.hide()
 
         # Legacy floating badges stay available internally, but the taskbar is the visible bottom UI now.
@@ -260,7 +279,7 @@ class RemoteDesktop(QMainWindow):
         )
         self.path_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.path_badge.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.path_badge.mousePressEvent = lambda event: self._show_path_badge_menu(event, self.path_badge)
+        self.path_badge.mousePressEvent = lambda ev: self._show_path_badge_menu(ev, self.path_badge)
         self.path_badge.hide()
 
         self.version_badge = QLabel(f"{APP_VERSION}", self.view.viewport())
@@ -274,10 +293,7 @@ class RemoteDesktop(QMainWindow):
         self._setup_taskbar()
 
         self.toast = QWidget(self)
-        self.toast.setStyleSheet(
-            "QWidget { background: rgba(8,12,18,0.92); border: 1px solid rgba(255,255,255,0.10); border-radius: 12px; }"
-            "QLabel { background: transparent; color: white; }"
-        )
+        self.toast.setStyleSheet(TOAST_STYLE)
         toast_layout = QHBoxLayout(self.toast)
         toast_layout.setContentsMargins(10, 7, 12, 7)
         toast_layout.setSpacing(8)
@@ -287,17 +303,30 @@ class RemoteDesktop(QMainWindow):
         self.toast_text.setStyleSheet("QLabel { color: #eef3f9; }")
         toast_layout.addWidget(self.toast_icon)
         toast_layout.addWidget(self.toast_text)
+        self.toast_opacity = QGraphicsOpacityEffect(self.toast)
+        self.toast_opacity.setOpacity(0.0)
+        self.toast.setGraphicsEffect(self.toast_opacity)
         self.toast.hide()
         self.toast_anim = None
+        self._toast_serial = 0
 
         self.rename_editor = QLineEdit(self.view.viewport())
         self.rename_editor.hide()
+        self.rename_editor.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.rename_editor.setStyleSheet(
-            "QLineEdit { background: rgba(0,0,0,0.75); color: white; padding: 3px 6px; "
-            "border: 1px solid rgba(255,255,255,0.35); border-radius: 7px; }"
+            "QLineEdit {"
+            " background: rgba(24, 24, 26, 0.94);"
+            " color: #f3f1ed;"
+            " padding: 2px 7px;"
+            " border: 1px solid rgba(216, 195, 154, 0.82);"
+            " border-radius: 5px;"
+            " selection-background-color: rgba(111, 96, 71, 0.75);"
+            " selection-color: #ffffff;"
+            "}"
         )
         self.rename_target_item = None
         self.rename_old_name = ""
+        self.rename_hidden_text_item = None
         self.rename_editor.returnPressed.connect(self._commit_inline_rename)
         self.rename_editor.editingFinished.connect(self._commit_inline_rename)
         self.rename_editor.installEventFilter(self)
@@ -305,89 +334,35 @@ class RemoteDesktop(QMainWindow):
         self.toolbar = QToolBar(self.T["nav"])
         self.toolbar.setMovable(False)
         self.toolbar.setFloatable(False)
-        self.toolbar.setIconSize(QSize(20, 20))
-        toolbar_font = QFont("Segoe UI Variable Text")
+        self.toolbar.setFixedHeight(62)
+        self.toolbar.setIconSize(QSize(18, 18))
+        toolbar_font = QFont("Segoe UI")
         toolbar_font.setPointSizeF(10.5)
         toolbar_font.setWeight(QFont.Weight.DemiBold)
         self.toolbar.setFont(toolbar_font)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.toolbar)
 
-        self.toolbar.setStyleSheet("""
-            QToolBar {
-                spacing: 12px;
-                padding: 8px 12px;
-                background: rgba(15,18,25,0.88);
-                border: none;
-                border-bottom: 1px solid rgba(255,255,255,0.06);
-            }
-            QToolBar::separator {
-                background: rgba(255,255,255,0.10);
-                width: 1px;
-                margin: 5px 10px;
-            }
-            QToolButton, QToolBar QLabel {
-                color: #eef3f9;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(255,255,255,0.10),
-                    stop:1 rgba(255,255,255,0.05));
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 14px;
-                padding: 8px 14px;
-                font-weight: 650;
-            }
-            QToolButton:hover {
-                background: rgba(110,168,255,0.16);
-                border: 1px solid rgba(110,168,255,0.34);
-            }
-            QToolButton:pressed {
-                background: rgba(110,168,255,0.22);
-            }
-            QToolButton::menu-indicator { image: none; width: 0px; }
-            QLineEdit {
-                color: #f3f7fc;
-                background: rgba(255,255,255,0.07);
-                border: 1px solid rgba(255,255,255,0.10);
-                border-radius: 14px;
-                padding: 9px 14px;
-                selection-background-color: rgba(110,168,255,0.30);
-                font-weight: 520;
-            }
-            QLineEdit:focus {
-                border: 1px solid rgba(110,168,255,0.45);
-                background: rgba(255,255,255,0.10);
-            }
-            QMenu {
-                background: rgba(16,20,28,0.96);
-                color: #eef3f9;
-                border: 1px solid rgba(255,255,255,0.08);
-                border-radius: 12px;
-                padding: 8px;
-                font-size: 10.5pt;
-            }
-            QMenu::item {
-                padding: 9px 14px;
-                border-radius: 8px;
-                margin: 2px 0px;
-            }
-            QMenu::item:selected {
-                background: rgba(110,168,255,0.18);
-            }
-            QMenu::separator {
-                height: 1px;
-                background: rgba(255,255,255,0.08);
-                margin: 6px 6px;
-            }
-        """)
+        self.toolbar.setStyleSheet(TOOLBAR_STYLE)
 
-        self.brand_label = QLabel("Xyra")
-        brand_font = QFont("Segoe UI Variable Display")
-        brand_font.setPointSizeF(12.5)
-        brand_font.setWeight(QFont.Weight.Bold)
-        self.brand_label.setFont(brand_font)
-        self.brand_label.setStyleSheet(
-            "QLabel { color: #f7fbff; background: transparent; border: none; padding: 0 8px 0 3px; }"
-        )
-        self.toolbar.addWidget(self.brand_label)
+        self.brand_widget = QWidget()
+        self.brand_widget.setMinimumWidth(130)
+        brand_layout = QHBoxLayout(self.brand_widget)
+        brand_layout.setContentsMargins(3, 0, 10, 0)
+        brand_layout.setSpacing(9)
+        self.brand_icon = QLabel()
+        self.brand_icon.setFixedSize(28, 28)
+        if os.path.exists(APP_LOGO_PATH):
+            self.brand_icon.setPixmap(
+                QPixmap(APP_LOGO_PATH).scaled(
+                    28, 28, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        self.brand_text = QLabel("<b>XYRA</b><br><span style='color:#8d8982;font-size:8pt'>REMOTE</span>")
+        self.brand_text.setStyleSheet("QLabel { color: #f3f1ed; background: transparent; border: none; }")
+        brand_layout.addWidget(self.brand_icon)
+        brand_layout.addWidget(self.brand_text)
+        self.toolbar.addWidget(self.brand_widget)
         self.toolbar.addSeparator()
 
         self.back_action = QAction(self._make_icon("fa6s.arrow-left"), self.T["back"], self)
@@ -414,11 +389,11 @@ class RemoteDesktop(QMainWindow):
         self.places_tool = QToolButton()
         self.places_tool.setFont(toolbar_font)
         self.places_tool.setText(self.T["quick_paths"])
-        self.places_tool.setIcon(self._make_icon("fa6s.route", "#f4c76b"))
+        self.places_tool.setIcon(self._make_icon("fa6s.route", "#d8c39a"))
         self.places_tool.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.places_tool.setCursor(Qt.CursorShape.PointingHandCursor)
         self.places_tool.setMinimumHeight(40)
-        self.places_tool.setMinimumWidth(146)
+        self.places_tool.setMinimumWidth(138)
         self.places_menu = QMenu(self.places_tool)
         self.places_menu.aboutToShow.connect(self._rebuild_places_menu)
         self.places_tool.setMenu(self.places_menu)
@@ -430,14 +405,14 @@ class RemoteDesktop(QMainWindow):
         self.display_tool = QToolButton()
         self.display_tool.setFont(toolbar_font)
         self.display_tool.setText(self.T["display"])
-        self.display_tool.setIcon(self._make_icon("fa6s.palette", "#8bd3ff"))
+        self.display_tool.setIcon(self._make_icon("fa6s.palette", "#c7b7d8"))
         self.display_tool.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.display_tool.setCursor(Qt.CursorShape.PointingHandCursor)
         self.display_tool.setMinimumHeight(40)
         self.display_tool.setMinimumWidth(124)
         display_menu = QMenu(self.display_tool)
         act_bg = display_menu.addAction(self.T["choose_bg"], self.change_background)
-        act_bg.setIcon(self._make_icon("fa6s.image", "#8bd3ff"))
+        act_bg.setIcon(self._make_icon("fa6s.image", "#c7b7d8"))
         act_icons = display_menu.addAction(self.T["change_icon_pack"], self.change_icon_pack)
         act_icons.setIcon(self._make_icon("fa6s.icons", "#f4c76b"))
         act_reset_icons = display_menu.addAction(self.T["reset_icon_pack"], self.reset_icon_pack)
@@ -451,11 +426,11 @@ class RemoteDesktop(QMainWindow):
         self.term_tool = QToolButton()
         self.term_tool.setFont(toolbar_font)
         self.term_tool.setText(self.T["terminal"])
-        self.term_tool.setIcon(self._make_icon("fa6s.terminal", "#7df0c1"))
+        self.term_tool.setIcon(self._make_icon("fa6s.terminal", "#8bc7a8"))
         self.term_tool.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.term_tool.setCursor(Qt.CursorShape.PointingHandCursor)
         self.term_tool.setMinimumHeight(40)
-        self.term_tool.setMinimumWidth(162)
+        self.term_tool.setMinimumWidth(148)
         self.term_menu = QMenu(self.term_tool)
         self.term_menu.aboutToShow.connect(self._rebuild_term_menu)
         self._rebuild_term_menu()
@@ -463,18 +438,17 @@ class RemoteDesktop(QMainWindow):
         self.term_tool.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.toolbar.addWidget(self.term_tool)
 
-        # Search box smaller
         self.toolbar.addSeparator()
         self.search_box = QLineEdit()
         self.search_box.setFont(toolbar_font)
         self.search_box.setPlaceholderText(self.T["search_placeholder"])
         self.search_box.setClearButtonEnabled(True)
         self.search_box.setMinimumHeight(42)
-        self.search_box.setFixedWidth(300)
+        self.search_box.setFixedWidth(320)
         self.search_box.textChanged.connect(self._on_search_changed)
-        search_action = self.search_box.addAction(self._make_icon("fa6s.magnifying-glass", "#9fb5ca"), QLineEdit.ActionPosition.LeadingPosition)
+        search_action = self.search_box.addAction(self._make_icon("fa6s.magnifying-glass", "#aaa69f"), QLineEdit.ActionPosition.LeadingPosition)
         search_action.setEnabled(False)
-        remote_search_action = self.search_box.addAction(self._make_icon("fa6s.server", "#7df0c1"), QLineEdit.ActionPosition.TrailingPosition)
+        remote_search_action = self.search_box.addAction(self._make_icon("fa6s.server", "#8bc7a8"), QLineEdit.ActionPosition.TrailingPosition)
         remote_search_action.setToolTip("Search server from current folder (Ctrl+Shift+F)")
         remote_search_action.triggered.connect(self.start_remote_search)
         self.toolbar.addWidget(self.search_box)
@@ -500,9 +474,48 @@ class RemoteDesktop(QMainWindow):
 
         self.connection_label = QLabel("")
         self.connection_label.setFont(toolbar_font)
-        self.connection_label.setMinimumWidth(230)
+        self.connection_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.connection_label.setMinimumWidth(166)
         self.connection_label.setMinimumHeight(40)
         self.toolbar.addWidget(self.connection_label)
+
+        self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
+        self.server_bar = QToolBar("Servers", self)
+        self.server_bar.setObjectName("serverBar")
+        self.server_bar.setMovable(False)
+        self.server_bar.setFloatable(False)
+        self.server_bar.setFixedHeight(43)
+        self.server_bar.setIconSize(QSize(15, 15))
+        self.server_bar.setStyleSheet(SERVER_BAR_STYLE)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.server_bar)
+
+        server_title = QLabel("SERVERS")
+        server_title.setObjectName("serverBarTitle")
+        self.server_bar.addWidget(server_title)
+
+        self.add_server_button = QToolButton()
+        self.add_server_button.setIcon(self._make_icon("fa6s.plus", "#d8c39a"))
+        self.add_server_button.setToolTip("Add or manage server profiles")
+        self.add_server_button.setCursor(Qt.CursorShape.ArrowCursor)
+        self.add_server_button.setFixedSize(30, 30)
+        self.add_server_button.clicked.connect(self.show_ssh_login_dialog)
+        self.server_bar.addWidget(self.add_server_button)
+        self.server_bar.addWidget(self._toolbar_gap(12))
+
+        self.server_tabs = QTabBar()
+        self.server_tabs.setDocumentMode(True)
+        self.server_tabs.setDrawBase(False)
+        self.server_tabs.setExpanding(False)
+        self.server_tabs.setMovable(False)
+        self.server_tabs.setTabsClosable(False)
+        self.server_tabs.setElideMode(Qt.TextElideMode.ElideRight)
+        self.server_tabs.setUsesScrollButtons(True)
+        self.server_tabs.setCursor(Qt.CursorShape.ArrowCursor)
+        self.server_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.server_tabs.currentChanged.connect(self._server_tab_changed)
+        self.server_bar.addWidget(self.server_tabs)
+        self._syncing_server_tabs = False
+        self._rebuild_server_tabs()
 
         self._load_icons()
         self._setup_backend(initial=True)
@@ -511,19 +524,15 @@ class RemoteDesktop(QMainWindow):
         if bg_path and os.path.exists(bg_path):
             self.bg_path = bg_path
 
-        self.current_path = normalize_api_path(self.cfg.get("start_path", "."))
+        self.discord_rpc.connect()
 
-        ws = self.cfg.get("window_size", None)
-        if isinstance(ws, list) and len(ws) == 2:
-            try:
-                self.resize(int(ws[0]), int(ws[1]))
-            except Exception:
-                self.showMaximized()
-        else:
-            self.showMaximized()
+        self.current_path = self._restore_server_workspace()
+
+        self._apply_initial_window_geometry()
 
         self.update_path_label()
         self.load_folder(self.current_path)
+        self.schedule_automatic_update_check()
 
     def _make_strings(self) -> dict:
         return {
@@ -556,20 +565,12 @@ class RemoteDesktop(QMainWindow):
             "icon_pack_changed": "Icon pack changed",
             "icon_pack_reset": "Default icon pack restored",
             "icon_pack_missing": "No supported icon files found. Expected names include linux_folder.png, linux_file.png, images.png or linux_archive.png.",
-            "icon_pack_info_title": "Icon pack guide",
-            "icon_pack_info": (
-                "Choose a folder that contains PNG files for the desktop icons.\n\n"
-                "Supported file names:\n"
-                "- linux_folder.png or folder.png\n"
-                "- linux_file.png or file.png\n"
-                "- images.png\n"
-                "- linux_archive.png\n\n"
-                "Images can be larger, Xyra will scale them down to 64x64 automatically."
-            ),
+            "icon_pack_custom": "Custom folder...",
+            "icon_pack_default": "Xyra Default",
             "terminal": "Remote",
             "ssh_connect": "Connect Server...",
             "ssh_disconnect": "Disconnect Server",
-            "ssh_profiles": "Quick servers",
+            "ssh_profiles": "Open server in tab",
             "server_health": "Server Health",
             "server_health_title": "Server Health",
             "server_health_checking": "Checking server health...",
@@ -581,6 +582,11 @@ class RemoteDesktop(QMainWindow):
             "uploading": "{file} is uploading ({mb:.2f} MB)...",
             "uploaded": "{file} uploaded",
             "upload_failed": "Upload failed",
+            "upload_finished": "Upload finished",
+            "upload_overwrite_title": "Overwrite existing item?",
+            "upload_overwrite_file": "A remote file with the same name already exists:\n\n{path}\n\nOverwrite it?",
+            "upload_overwrite_folder": "A remote folder with the same name already exists:\n\n{path}\n\nMerge into it and overwrite matching files?",
+            "upload_conflict_type": "A remote item with the same name but a different type already exists:\n\n{path}\n\nXyra will not replace it automatically.",
             "rename": "Rename",
             "delete": "Move to trash",
             "delete_permanently": "Delete permanently",
@@ -588,6 +594,18 @@ class RemoteDesktop(QMainWindow):
             "permanent_delete_q": "Permanently delete?\n\n{path}\n\nThis cannot be undone by Xyra.",
             "trash_failed": "Move to trash failed",
             "trashed": "Moved to trash",
+            "trash_manager": "Trash Manager",
+            "trash_empty": "Trash is empty.",
+            "trash_restore": "Restore",
+            "trash_delete": "Delete permanently",
+            "trash_empty_all": "Empty trash",
+            "trash_open_original": "Open original folder",
+            "trash_loaded_failed": "Could not load trash",
+            "trash_restored": "Restored",
+            "trash_restore_failed": "Restore failed",
+            "trash_deleted": "Trash item deleted",
+            "trash_empty_q": "Permanently delete all items in .xyra-trash?\n\nThis cannot be undone by Xyra.",
+            "trash_empty_done": "Trash emptied",
             "copy_path": "Copy path",
             "copy_current_path": "Copy current path",
             "path_copied": "Path copied",
@@ -603,6 +621,22 @@ class RemoteDesktop(QMainWindow):
             "download": "Download...",
             "downloaded": "Downloaded",
             "download_failed": "Download failed",
+            "download_finished": "Download finished",
+            "download_overwrite_title": "Overwrite local file?",
+            "download_overwrite_q": "A local file with the same name already exists:\n\n{path}\n\nOverwrite it?",
+            "sensitive_title": "Sensitive item",
+            "sensitive_warning": (
+                "This looks like a sensitive file or folder:\n\n"
+                "{path}\n\n"
+                "It may contain credentials, private keys, tokens or server secrets.\n"
+                "Continue with this action?"
+            ),
+            "sensitive_multi_warning": (
+                "Your selection contains sensitive items:\n\n"
+                "{items}\n\n"
+                "They may contain credentials, private keys, tokens or server secrets.\n"
+                "Continue with this action?"
+            ),
             "copy_title": "Copy",
             "move_title": "Move",
             "extract_title": "Extract",
@@ -685,60 +719,17 @@ class RemoteDesktop(QMainWindow):
     def _setup_taskbar(self):
         self.taskbar = QWidget(self)
         self.taskbar.setObjectName("xyraTaskbar")
-        self.taskbar.setFixedHeight(64)
-        self.taskbar.setStyleSheet("""
-            QWidget#xyraTaskbar {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 rgba(8, 12, 20, 0.90),
-                    stop:0.48 rgba(17, 24, 35, 0.88),
-                    stop:1 rgba(8, 12, 20, 0.90));
-                border: 1px solid rgba(255,255,255,0.13);
-                border-radius: 22px;
-            }
-            QLabel {
-                color: #eef3f9;
-                background: transparent;
-            }
-            QToolButton {
-                color: #eef3f9;
-                background: rgba(255,255,255,0.075);
-                border: 1px solid rgba(255,255,255,0.10);
-                border-radius: 16px;
-                padding: 9px 14px;
-                font-weight: 700;
-            }
-            QToolButton:hover {
-                background: rgba(110,168,255,0.20);
-                border-color: rgba(110,168,255,0.42);
-            }
-            QToolButton:pressed {
-                background: rgba(110,168,255,0.30);
-            }
-            QMenu {
-                background: rgba(16,20,28,0.96);
-                color: #eef3f9;
-                border: 1px solid rgba(255,255,255,0.08);
-                border-radius: 12px;
-                padding: 8px;
-            }
-            QMenu::item {
-                padding: 9px 14px;
-                border-radius: 8px;
-                margin: 2px 0px;
-            }
-            QMenu::item:selected {
-                background: rgba(110,168,255,0.18);
-            }
-            QMenu::separator {
-                height: 1px;
-                background: rgba(255,255,255,0.08);
-                margin: 6px 6px;
-            }
-        """)
+        self.taskbar.setFixedHeight(58)
+        self.taskbar.setStyleSheet(TASKBAR_STYLE)
+        dock_shadow = QGraphicsDropShadowEffect(self.taskbar)
+        dock_shadow.setBlurRadius(30)
+        dock_shadow.setOffset(0, 8)
+        dock_shadow.setColor(QColor(0, 0, 0, 150))
+        self.taskbar.setGraphicsEffect(dock_shadow)
 
         layout = QHBoxLayout(self.taskbar)
-        layout.setContentsMargins(12, 9, 12, 9)
-        layout.setSpacing(9)
+        layout.setContentsMargins(9, 8, 9, 8)
+        layout.setSpacing(7)
 
         self.task_start_button = QToolButton(self.taskbar)
         self.task_start_button.setText("Xyra")
@@ -748,66 +739,73 @@ class RemoteDesktop(QMainWindow):
             self.task_start_button.setIcon(QIcon(APP_LOGO_PATH))
         self.task_start_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.task_start_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.task_start_button.setIconSize(QSize(22, 22))
-        self.task_start_button.setMinimumWidth(104)
-        self.task_start_button.setMinimumHeight(44)
+        self.task_start_button.setIconSize(QSize(20, 20))
+        self.task_start_button.setMinimumWidth(98)
+        self.task_start_button.setMinimumHeight(40)
         self.task_start_button.setStyleSheet(
-            "QToolButton { color: #f7fbff; background: rgba(244,199,107,0.12); "
-            "border: 1px solid rgba(244,199,107,0.30); border-radius: 17px; "
-            "padding: 9px 15px; font-weight: 850; } "
-            "QToolButton:hover { background: rgba(244,199,107,0.20); border-color: rgba(244,199,107,0.50); }"
+            "QToolButton { color: #f3f1ed; background: #24211d; border: 1px solid #574b38; "
+            "border-radius: 11px; padding: 7px 13px; font-weight: 800; } "
+            "QToolButton:hover { background: #292724; border-color: #d8c39a; }"
         )
         self.task_start_button.clicked.connect(self._show_taskbar_menu)
         layout.addWidget(self.task_start_button)
 
         self.task_path_label = QLabel("/", self.taskbar)
         self.task_path_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.task_path_label.setMinimumHeight(44)
+        self.task_path_label.setMinimumHeight(40)
         self.task_path_label.setMinimumWidth(220)
         self.task_path_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.task_path_label.setStyleSheet(
-            "QLabel { color: #dfefff; background: rgba(110,168,255,0.105); "
-            "border: 1px solid rgba(110,168,255,0.24); border-radius: 17px; "
-            "padding: 9px 16px; font-weight: 750; } "
-            "QLabel:hover { background: rgba(110,168,255,0.16); border-color: rgba(110,168,255,0.36); }"
+            "QLabel { color: #dedbd5; background: #18181b; border: 1px solid #343438; "
+            "border-radius: 11px; padding: 7px 14px; font-weight: 650; } "
+            "QLabel:hover { color: #ffffff; background: #222225; border-color: #57534d; }"
         )
-        self.task_path_label.mousePressEvent = lambda event: self._show_path_badge_menu(event, self.task_path_label)
+        self.task_path_label.mousePressEvent = lambda ev: self._show_path_badge_menu(ev, self.task_path_label)
         layout.addWidget(self.task_path_label, 1)
 
         self.task_search_button = QToolButton(self.taskbar)
-        self.task_search_button.setIcon(self._make_icon("fa6s.magnifying-glass", "#8bd3ff"))
+        self.task_search_button.setIcon(self._make_icon("fa6s.magnifying-glass", "#c7c3bc"))
         self.task_search_button.setText("Search")
         self.task_search_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.task_search_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.task_search_button.setMinimumHeight(44)
+        self.task_search_button.setMinimumHeight(40)
         self.task_search_button.clicked.connect(self._show_task_search_menu)
         layout.addWidget(self.task_search_button)
+
+        self.task_transfers_button = QToolButton(self.taskbar)
+        self.task_transfers_button.setIcon(self._make_icon("fa6s.arrow-right-arrow-left", "#d8c39a"))
+        self.task_transfers_button.setText("Transfers")
+        self.task_transfers_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.task_transfers_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.task_transfers_button.setMinimumHeight(40)
+        self.task_transfers_button.clicked.connect(self._show_transfer_center)
+        layout.addWidget(self.task_transfers_button)
 
         self.task_health_button = QToolButton(self.taskbar)
         self.task_health_button.setIcon(self._make_icon("fa6s.heart-pulse", "#ff9ea5"))
         self.task_health_button.setText("Health")
         self.task_health_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.task_health_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.task_health_button.setMinimumHeight(44)
+        self.task_health_button.setMinimumHeight(40)
         self.task_health_button.clicked.connect(self.show_server_health)
         layout.addWidget(self.task_health_button)
 
         self.task_fullscreen_button = QToolButton(self.taskbar)
         self.task_fullscreen_button.setIcon(self._make_icon("fa6s.up-right-and-down-left-from-center", "#f4c76b"))
         self.task_fullscreen_button.setText("F11")
+        self.task_fullscreen_button.setToolTip("Toggle fullscreen (F11)")
         self.task_fullscreen_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.task_fullscreen_button.setMinimumHeight(44)
+        self.task_fullscreen_button.setMinimumHeight(40)
         self.task_fullscreen_button.clicked.connect(self.toggle_fullscreen)
         layout.addWidget(self.task_fullscreen_button)
 
         self.task_time_label = QLabel("", self.taskbar)
-        self.task_time_label.setMinimumWidth(84)
-        self.task_time_label.setMinimumHeight(44)
+        self.task_time_label.setMinimumWidth(76)
+        self.task_time_label.setMinimumHeight(40)
         self.task_time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.task_time_label.setStyleSheet(
-            "QLabel { color: #f4c76b; background: rgba(244,199,107,0.10); "
-            "border: 1px solid rgba(244,199,107,0.22); border-radius: 17px; "
-            "padding: 9px 13px; font-weight: 800; }"
+            "QLabel { color: #aaa69f; background: #19191b; border: 1px solid #303034; "
+            "border-radius: 11px; padding: 7px 12px; font-weight: 700; }"
         )
         layout.addWidget(self.task_time_label)
 
@@ -817,14 +815,74 @@ class RemoteDesktop(QMainWindow):
         self.task_clock.start(30000)
         self._update_taskbar_clock()
 
+    def _update_responsive_toolbar(self):
+        """Keep the command bar useful instead of clipping at smaller widths."""
+        if not hasattr(self, "search_box"):
+            return
+
+        compact = self.width() < 1380
+        self.search_box.setFixedWidth(220 if compact else 320)
+        self.brand_text.setVisible(not compact)
+        self.brand_widget.setMinimumWidth(46 if compact else 130)
+        self.brand_widget.setMaximumWidth(52 if compact else 16777215)
+        self.connection_label.setMinimumWidth(122 if compact else 166)
+
+        tools = (
+            (self.places_tool, 138),
+            (self.display_tool, 124),
+            (self.term_tool, 148),
+        )
+        for tool, normal_width in tools:
+            tool.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonIconOnly
+                if compact else Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+            )
+            tool.setMinimumWidth(46 if compact else normal_width)
+            tool.setMaximumWidth(46 if compact else 16777215)
+            tool.setToolTip(tool.text() if compact else "")
+
+        compact_dock = self.width() < 1100
+        for button, tooltip in (
+            (getattr(self, "task_transfers_button", None), "Transfers"),
+            (getattr(self, "task_health_button", None), "Server health"),
+        ):
+            if button is None:
+                continue
+            button.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonIconOnly
+                if compact_dock else Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+            )
+            button.setMinimumWidth(42 if compact_dock else 0)
+            button.setMaximumWidth(46 if compact_dock else 16777215)
+            if compact_dock:
+                button.setToolTip(tooltip)
+
     def _show_taskbar_menu(self):
         menu = QMenu(self)
         act_refresh = menu.addAction(self.T["refresh"])
-        act_refresh.setIcon(self._make_icon("fa6s.rotate-right", "#8bd3ff"))
+        act_refresh.setIcon(self._make_icon("fa6s.rotate-right", "#c7c3bc"))
+        act_trash = menu.addAction(self.T["trash_manager"])
+        act_trash.setIcon(self._make_icon("fa6s.trash-can-arrow-up", "#f4c76b"))
         act_health = menu.addAction(self.T["server_health"])
         act_health.setIcon(self._make_icon("fa6s.heart-pulse", "#ff9ea5"))
         act_fullscreen = menu.addAction(self.T["fullscreen_off"] if self.isFullScreen() else self.T["fullscreen_on"])
         act_fullscreen.setIcon(self._make_icon("fa6s.up-right-and-down-left-from-center", "#f4c76b"))
+        update_menu = menu.addMenu("Updates")
+        update_menu.setIcon(self._make_icon("fa6s.shield-halved", "#8bc7a8"))
+        act_check_updates = update_menu.addAction("Check for updates...")
+        act_check_updates.setIcon(self._make_icon("fa6s.arrows-rotate", "#c7c3bc"))
+        update_menu.addSeparator()
+        act_stable_updates = update_menu.addAction("Stable channel")
+        act_stable_updates.setCheckable(True)
+        act_preview_updates = update_menu.addAction("Preview channel")
+        act_preview_updates.setCheckable(True)
+        update_channel = self.cfg.get("update_channel", "stable")
+        act_stable_updates.setChecked(update_channel == "stable")
+        act_preview_updates.setChecked(update_channel == "prerelease")
+        update_menu.addSeparator()
+        act_auto_updates = update_menu.addAction("Check automatically on startup")
+        act_auto_updates.setCheckable(True)
+        act_auto_updates.setChecked(bool(self.cfg.get("automatic_update_checks", True)))
         menu.addSeparator()
         act_about = menu.addAction(self.T["about"])
         act_about.setIcon(self._make_icon("fa6s.circle-info", "#f4c76b"))
@@ -832,19 +890,29 @@ class RemoteDesktop(QMainWindow):
         chosen = self._exec_menu_above_widget(menu, self.task_start_button)
         if chosen == act_refresh:
             self.refresh_session()
+        elif chosen == act_trash:
+            self.show_trash_manager()
         elif chosen == act_health:
             self.show_server_health()
         elif chosen == act_fullscreen:
             self.toggle_fullscreen()
+        elif chosen == act_check_updates:
+            self.check_for_updates(manual=True)
+        elif chosen == act_stable_updates:
+            self.set_update_channel("stable")
+        elif chosen == act_preview_updates:
+            self.set_update_channel("prerelease")
+        elif chosen == act_auto_updates:
+            self.toggle_automatic_update_checks()
         elif chosen == act_about:
             self.show_about_dialog()
 
     def _show_task_search_menu(self):
         menu = QMenu(self)
         act_local = menu.addAction("Focus search")
-        act_local.setIcon(self._make_icon("fa6s.magnifying-glass", "#8bd3ff"))
+        act_local.setIcon(self._make_icon("fa6s.magnifying-glass", "#c7c3bc"))
         act_remote = menu.addAction(self.T["remote_search_title"])
-        act_remote.setIcon(self._make_icon("fa6s.server", "#7df0c1"))
+        act_remote.setIcon(self._make_icon("fa6s.server", "#8bc7a8"))
 
         chosen = self._exec_menu_above_widget(menu, self.task_search_button)
         if chosen == act_local:
@@ -871,11 +939,11 @@ class RemoteDesktop(QMainWindow):
     def _reposition_taskbar(self):
         if not hasattr(self, "taskbar"):
             return
-        margin = 16
+        margin = 18
         h = self.taskbar.height()
         window_w = max(320, self.width())
         window_h = max(220, self.height())
-        width = min(max(720, int(window_w * 0.72)), max(320, window_w - margin * 2))
+        width = min(max(720, int(window_w * 0.64)), 1120, max(320, window_w - margin * 2))
         x = max(margin, (window_w - width) // 2)
         y = max(margin, window_h - h - margin)
         self.taskbar.setGeometry(x, y, width, h)
@@ -889,7 +957,7 @@ class RemoteDesktop(QMainWindow):
         current_path = normalize_api_path(getattr(self, "current_path", start_path))
 
         act_start = menu.addAction(f"{self.T['open_start_path']}: {self._display_server_path(start_path)}")
-        act_start.setIcon(self._make_icon("fa6s.house", "#8bd3ff"))
+        act_start.setIcon(self._make_icon("fa6s.house", "#d8c39a"))
         act_start.triggered.connect(lambda checked=False, p=start_path: self._navigate_to_path(p))
 
         act_set_start = menu.addAction(f"{self.T['set_start_path']}: {self._display_server_path(current_path)}")
@@ -923,7 +991,7 @@ class RemoteDesktop(QMainWindow):
 
         menu.addSeparator()
         recent_menu = menu.addMenu(self.T["recent_paths"])
-        recent_menu.setIcon(self._make_icon("fa6s.clock-rotate-left", "#7df0c1"))
+        recent_menu.setIcon(self._make_icon("fa6s.clock-rotate-left", "#c7b7d8"))
 
         recent_paths = self._clean_saved_paths(self.cfg.get("recent_paths", []))
         if recent_paths:
@@ -949,10 +1017,63 @@ class RemoteDesktop(QMainWindow):
     def _record_recent_path(self, path: str):
         norm = normalize_api_path(path)
         recent_paths = self._clean_saved_paths(self.cfg.get("recent_paths", []))
-        recent_paths = [p for p in recent_paths if p != norm]
-        recent_paths.insert(0, norm)
-        self.cfg["recent_paths"] = recent_paths[:10]
+        updated = [norm] + [p for p in recent_paths if p != norm]
+        updated = updated[:10]
+        if recent_paths == updated:
+            return
+        self.cfg["recent_paths"] = updated
         save_recent_paths(self.cfg["recent_paths"])
+        self._save_current_server_workspace()
+
+    def _current_profile_data(self) -> dict:
+        return {
+            "profile_name": self.cfg.get("ssh_profile_name") or self.cfg.get("profile_name") or "",
+            "ssh_host": self.cfg.get("ssh_host") or "",
+            "ssh_port": self.cfg.get("ssh_port", 22),
+            "ssh_username": self.cfg.get("ssh_username") or "",
+            "ssh_root": self.cfg.get("ssh_root") or ".",
+        }
+
+    def _save_current_server_workspace(self):
+        if not (self.cfg.get("ssh_host") and self.cfg.get("ssh_username")):
+            return
+        identity = profile_identity(self._current_profile_data())
+        workspaces = self.cfg.get("server_workspaces")
+        if not isinstance(workspaces, dict):
+            workspaces = {}
+            self.cfg["server_workspaces"] = workspaces
+        workspaces[identity] = clean_workspace({
+            "current_path": getattr(self, "current_path", self.cfg.get("start_path", ".")),
+            "start_path": self.cfg.get("start_path", "."),
+            "favorites": self.cfg.get("favorites", []),
+            "recent_paths": self.cfg.get("recent_paths", []),
+        })
+        save_server_workspace(identity, workspaces[identity])
+
+    def _restore_server_workspace(self) -> str:
+        profile = self._current_profile_data()
+        configured = bool(profile.get("ssh_host") and profile.get("ssh_username"))
+        identity = profile_identity(profile) if configured else ""
+        self._active_server_id = identity
+        workspaces = self.cfg.get("server_workspaces")
+        if not isinstance(workspaces, dict):
+            workspaces = {}
+            self.cfg["server_workspaces"] = workspaces
+        fallback = {
+            "current_path": self.cfg.get("start_path", "."),
+            "start_path": self.cfg.get("start_path", "."),
+            "favorites": self.cfg.get("favorites", []),
+            "recent_paths": self.cfg.get("recent_paths", []),
+        }
+        workspace = clean_workspace(workspaces.get(identity, fallback))
+        self.cfg["start_path"] = workspace["start_path"]
+        self.cfg["favorites"] = workspace["favorites"]
+        self.cfg["recent_paths"] = workspace["recent_paths"]
+        self.history.clear()
+        self.future.clear()
+        self.search_query = ""
+        self.selected_names.clear()
+        return workspace["current_path"]
 
     def _toggle_favorite_path(self, path: str):
         norm = normalize_api_path(path)
@@ -965,13 +1086,17 @@ class RemoteDesktop(QMainWindow):
             toast_text = self.T["favorite_added"]
         self.cfg["favorites"] = favorites[:50]
         save_favorites(self.cfg["favorites"])
+        self._save_current_server_workspace()
         self.show_toast(toast_text, "fa6s.star", "#f4c76b")
 
     def _can_change_path(self) -> bool:
-        if not self._remote_search_active:
-            return True
-        self.show_toast(self.T["path_change_blocked"], "fa6s.magnifying-glass", "#f4c76b")
-        return False
+        if self._remote_search_active:
+            self.show_toast(self.T["path_change_blocked"], "fa6s.magnifying-glass", "#f4c76b")
+            return False
+        if self._remote_job_active:
+            self.show_toast(self.T["remote_job_busy"], "fa6s.hourglass-half", "#f4c76b")
+            return False
+        return True
 
     def _navigate_to_path(self, path: str):
         if not self._can_change_path():
@@ -980,26 +1105,337 @@ class RemoteDesktop(QMainWindow):
         if target == normalize_api_path(self.current_path):
             self.refresh_session()
             return
-        self.history.append(self.current_path)
-        self.future.clear()
-        self.current_path = target
-        self.update_path_label()
-        self.load_folder(self.current_path)
+        self._clear_local_search_filter()
+        self.load_folder(target, navigation_mode="normal")
 
     def _set_current_path_as_start(self):
         self.cfg["start_path"] = normalize_api_path(self.current_path)
         save_config(self.cfg)
+        self._save_current_server_workspace()
         self.show_toast(self.T["start_path_set"], "fa6s.location-dot", "#53d18b")
 
     def _clear_recent_paths(self):
         self.cfg["recent_paths"] = []
         save_recent_paths(self.cfg["recent_paths"])
+        self._save_current_server_workspace()
         self.show_toast(self.T["recent_paths_cleared"], "fa6s.broom", "#f4c76b")
 
     def _clear_favorites(self):
         self.cfg["favorites"] = []
         save_favorites(self.cfg["favorites"])
+        self._save_current_server_workspace()
         self.show_toast(self.T["favorites_cleared"], "fa6s.broom", "#f4c76b")
+
+    def _saved_server_profiles(self) -> list[dict]:
+        return [
+            dict(profile) for profile in self.cfg.get("ssh_profiles", [])
+            if isinstance(profile, dict)
+            and (profile.get("ssh_host") or "").strip()
+            and (profile.get("ssh_username") or "").strip()
+        ]
+
+    def _backend_is_connected(self) -> bool:
+        backend = self.backend
+        if backend is None:
+            return False
+        try:
+            return bool(backend.is_connected())
+        except Exception:
+            return False
+
+    def _current_server_tab_state(self) -> dict:
+        return {
+            "current_path": normalize_api_path(getattr(self, "current_path", ".")),
+            "history": list(self.history),
+            "future": list(self.future),
+            "search_query": self.search_query,
+            "current_items": [dict(item) for item in self.current_items if isinstance(item, dict)],
+            "selected_names": list(self.selected_names),
+        }
+
+    def _capture_active_server_tab_state(self):
+        session_id = self._active_server_session_id
+        if session_id is None or not hasattr(self, "current_path"):
+            return
+        for session in self._server_tab_sessions:
+            if session.get("session_id") == session_id:
+                session["state"] = self._current_server_tab_state()
+                return
+
+    def _restore_server_tab_state(self, session: dict):
+        state = session.get("state") if isinstance(session, dict) else None
+        if not isinstance(state, dict):
+            session["state"] = self._current_server_tab_state()
+            return
+
+        self._folder_load_generation += 1
+        self.current_path = normalize_api_path(state.get("current_path", "."))
+        self.history = list(state.get("history", []))
+        self.future = list(state.get("future", []))
+        self.search_query = str(state.get("search_query", ""))
+        self.current_items = [
+            dict(item) for item in state.get("current_items", [])
+            if isinstance(item, dict)
+        ]
+        self.selected_names = set(state.get("selected_names", []))
+        self.search_box.blockSignals(True)
+        self.search_box.setText(self.search_query)
+        self.search_box.blockSignals(False)
+        self.update_path_label()
+        self._render_folder_items()
+        self.load_folder(self.current_path)
+
+    def _add_server_tab_session(self, profile: dict, state: dict | None = None) -> int:
+        self._server_session_serial += 1
+        session_id = self._server_session_serial
+        self._server_tab_sessions.append({
+            "session_id": session_id,
+            "profile": dict(profile),
+            "state": dict(state) if isinstance(state, dict) else None,
+        })
+        return session_id
+
+    def _sync_server_tab_sessions(self):
+        profiles = self._saved_server_profiles()
+        saved_by_identity = {
+            profile_identity(profile): profile for profile in profiles
+            if profile_identity(profile) not in self._dismissed_server_identities
+        }
+        retained = []
+
+        for session in self._server_tab_sessions:
+            profile = session.get("profile") if isinstance(session, dict) else None
+            if not isinstance(profile, dict):
+                continue
+            identity = profile_identity(profile)
+            saved = saved_by_identity.get(identity)
+            if saved is not None:
+                session["profile"] = dict(saved)
+            retained.append(session)
+
+        self._server_tab_sessions = retained
+        if self._backend_is_connected() and not self._server_tab_sessions:
+            active = self._current_profile_data()
+            active_identity = profile_identity(active)
+            self._add_server_tab_session(saved_by_identity.get(active_identity, active))
+
+    def _select_connected_server_session(
+        self,
+        profile: dict,
+        *,
+        force_new: bool,
+        capture_current: bool = True,
+    ):
+        source_state = self._current_server_tab_state()
+        if capture_current:
+            self._capture_active_server_tab_state()
+        identity = profile_identity(profile)
+        self._dismissed_server_identities.discard(identity)
+        self._sync_server_tab_sessions()
+        session_id = None
+        if not force_new:
+            for session in self._server_tab_sessions:
+                if profile_identity(session["profile"]) == identity:
+                    session_id = session["session_id"]
+                    break
+        if session_id is None:
+            session_id = self._add_server_tab_session(profile, source_state)
+        self._active_server_session_id = session_id
+        self._rebuild_server_tabs()
+
+    def _rebuild_server_tabs(self):
+        if not hasattr(self, "server_tabs") or self._syncing_server_tabs:
+            return
+
+        self._sync_server_tab_sessions()
+        sessions = list(self._server_tab_sessions)
+        connected = self._backend_is_connected()
+        active_identity = ""
+        if connected:
+            active_identity = getattr(self, "_active_server_id", "")
+            if not active_identity:
+                active_identity = profile_identity(self._current_profile_data())
+
+        identity_totals = {}
+        for session in sessions:
+            identity = profile_identity(session["profile"])
+            identity_totals[identity] = identity_totals.get(identity, 0) + 1
+        identity_occurrence = {}
+
+        self._syncing_server_tabs = True
+        self.server_tabs.blockSignals(True)
+        try:
+            while self.server_tabs.count():
+                self.server_tabs.removeTab(0)
+
+            active_index = -1
+            fallback_index = -1
+            for session in sessions:
+                profile = session["profile"]
+                identity = profile_identity(profile)
+                identity_occurrence[identity] = identity_occurrence.get(identity, 0) + 1
+                occurrence = identity_occurrence[identity]
+                name = profile_display_name(profile)
+                tab_name = f"{name} - {occurrence}" if identity_totals[identity] > 1 else name
+                index = self.server_tabs.addTab(
+                    self._make_icon("fa6s.server", profile_accent(profile)),
+                    tab_name,
+                )
+                self.server_tabs.setTabData(index, dict(session))
+                close_button = QToolButton(self.server_tabs)
+                close_button.setObjectName("serverTabCloseButton")
+                close_button.setText("×")
+                close_button.setToolTip(f"Close {tab_name}")
+                close_button.setCursor(Qt.CursorShape.ArrowCursor)
+                close_button.setAutoRaise(True)
+                close_button.setFixedSize(16, 16)
+                close_button.clicked.connect(
+                    lambda checked=False, sid=session["session_id"]: self._close_server_session(sid)
+                )
+                self.server_tabs.setTabButton(
+                    index,
+                    QTabBar.ButtonPosition.RightSide,
+                    close_button,
+                )
+                self.server_tabs.setTabToolTip(
+                    index,
+                    f"{name}\n{profile.get('ssh_username')}@{profile.get('ssh_host')}"
+                    f":{profile.get('ssh_port', 22)}\nSession {occurrence} - click to switch",
+                )
+                if connected and identity == active_identity:
+                    if fallback_index < 0:
+                        fallback_index = index
+                    if session["session_id"] == self._active_server_session_id:
+                        active_index = index
+
+            if active_index < 0:
+                active_index = fallback_index
+                if active_index >= 0:
+                    active_session = self.server_tabs.tabData(active_index)
+                    self._active_server_session_id = active_session["session_id"]
+
+            self.server_tabs.setCurrentIndex(active_index)
+            self.server_tabs.setVisible(bool(sessions))
+            self.server_bar.setVisible(connected and len(sessions) > 1)
+        finally:
+            self.server_tabs.blockSignals(False)
+            self._syncing_server_tabs = False
+
+    def _server_tab_changed(self, index: int):
+        if self._syncing_server_tabs or index < 0:
+            return
+        session = self.server_tabs.tabData(index)
+        if not isinstance(session, dict):
+            return
+        profile = session.get("profile")
+        session_id = session.get("session_id")
+        if not isinstance(profile, dict) or not isinstance(session_id, int):
+            return
+        if self._backend_is_connected() and session_id == self._active_server_session_id:
+            return
+
+        self._capture_active_server_tab_state()
+        same_server = (
+            self._backend_is_connected()
+            and profile_identity(profile) == getattr(self, "_active_server_id", "")
+        )
+        if same_server:
+            self._active_server_session_id = session_id
+            self._restore_server_tab_state(session)
+            self._rebuild_server_tabs()
+            self._update_connection_label()
+            return
+
+        name = profile_display_name(profile)
+        self._syncing_server_tabs = True
+        self.connection_label.setText(f"CONNECTING  {name}")
+        self.connection_label.setToolTip(f"Connecting to {name}...")
+        QApplication.processEvents()
+        try:
+            if self.connect_ssh_profile(profile):
+                self._active_server_session_id = session_id
+                self._restore_server_tab_state(session)
+        finally:
+            self._syncing_server_tabs = False
+            self.server_tabs.setCursor(Qt.CursorShape.ArrowCursor)
+            self._rebuild_server_tabs()
+            self._update_connection_label()
+
+    def _close_server_session(self, session_id: int):
+        for index in range(self.server_tabs.count()):
+            session = self.server_tabs.tabData(index)
+            if isinstance(session, dict) and session.get("session_id") == session_id:
+                self._close_server_tab(index)
+                return
+
+    def _close_server_tab(self, index: int):
+        if self._syncing_server_tabs or index < 0:
+            return
+        session = self.server_tabs.tabData(index)
+        if not isinstance(session, dict):
+            return
+        session_id = session.get("session_id")
+        profile = session.get("profile")
+        if not isinstance(session_id, int) or not isinstance(profile, dict):
+            return
+
+        was_active = session_id == self._active_server_session_id
+        if was_active:
+            self._capture_active_server_tab_state()
+        old_sessions = list(self._server_tab_sessions)
+        self._server_tab_sessions = [
+            candidate for candidate in self._server_tab_sessions
+            if candidate.get("session_id") != session_id
+        ]
+
+        identity = profile_identity(profile)
+        if not any(
+            profile_identity(candidate["profile"]) == identity
+            for candidate in self._server_tab_sessions
+        ):
+            self._dismissed_server_identities.add(identity)
+
+        if not was_active:
+            self._rebuild_server_tabs()
+            return
+        if not self._server_tab_sessions:
+            self._active_server_session_id = None
+            self.disconnect_ssh()
+            return
+
+        target_index = min(index, len(self._server_tab_sessions) - 1)
+        target = self._server_tab_sessions[target_index]
+        target_profile = target["profile"]
+        same_server = (
+            self._backend_is_connected()
+            and profile_identity(target_profile) == getattr(self, "_active_server_id", "")
+        )
+        if same_server or self.connect_ssh_profile(target_profile):
+            self._active_server_session_id = target["session_id"]
+            self._restore_server_tab_state(target)
+            self._rebuild_server_tabs()
+            self._update_connection_label()
+            return
+
+        self._server_tab_sessions = old_sessions
+        self._dismissed_server_identities.discard(identity)
+        self._active_server_session_id = session_id
+        self._rebuild_server_tabs()
+
+    def _open_profile_session(self, profile: dict) -> bool:
+        already_connected = self._backend_is_connected()
+        same_server = (
+            already_connected
+            and profile_identity(profile) == getattr(self, "_active_server_id", "")
+        )
+        if not self.connect_ssh_profile(profile):
+            return False
+        self._select_connected_server_session(
+            profile,
+            force_new=already_connected,
+            capture_current=same_server,
+        )
+        return True
 
     def _rebuild_term_menu(self):
         term_menu = self.term_menu
@@ -1007,21 +1443,24 @@ class RemoteDesktop(QMainWindow):
 
         act_connect = term_menu.addAction(self.T["ssh_connect"], self.show_ssh_login_dialog)
         act_disconnect = term_menu.addAction(self.T["ssh_disconnect"], self.disconnect_ssh)
+        act_trash = term_menu.addAction(self.T["trash_manager"], self.show_trash_manager)
         act_health = term_menu.addAction(self.T["server_health"], self.show_server_health)
         term_menu.addSeparator()
 
         profiles_menu = term_menu.addMenu(self.T["ssh_profiles"])
-        profiles_menu.setIcon(self._make_icon("fa6s.server", "#8bd3ff"))
+        profiles_menu.setIcon(self._make_icon("fa6s.server", "#c7c3bc"))
 
-        profiles = [
-            p for p in self.cfg.get("ssh_profiles", [])
-            if isinstance(p, dict) and (p.get("ssh_host") or "").strip() and (p.get("ssh_username") or "").strip()
-        ]
+        profiles = self._saved_server_profiles()
         if profiles:
+            active_name = (self.cfg.get("ssh_profile_name") or "").strip()
             for profile in profiles:
-                profile_name = (profile.get("profile_name") or profile.get("ssh_host") or "Unnamed profile").strip()
+                profile_name = profile_display_name(profile)
                 action = profiles_menu.addAction(profile_name)
-                action.triggered.connect(lambda checked=False, p=dict(profile): self.connect_ssh_profile(p))
+                action.setCheckable(True)
+                action.setChecked(profile_name == active_name and self.backend is not None)
+                action.setIcon(self._make_icon("fa6s.server", profile_accent(profile)))
+                action.setStatusTip(f"Open {profile_name} in a Xyra tab")
+                action.triggered.connect(lambda checked=False, p=dict(profile): self._open_profile_session(p))
         else:
             empty_action = profiles_menu.addAction("No saved profiles")
             empty_action.setEnabled(False)
@@ -1030,36 +1469,188 @@ class RemoteDesktop(QMainWindow):
         act_putty = term_menu.addAction(self.T["open_putty"], lambda: self._launch_tool("putty"))
         act_termius = term_menu.addAction(self.T["open_termius"], lambda: self._launch_tool("termius"))
 
-        act_connect.setIcon(self._make_icon("fa6s.plug-circle-bolt", "#7df0c1"))
+        act_connect.setIcon(self._make_icon("fa6s.plug-circle-bolt", "#8bc7a8"))
         act_disconnect.setIcon(self._make_icon("fa6s.power-off", "#ff9ea5"))
+        act_trash.setIcon(self._make_icon("fa6s.trash-can-arrow-up", "#f4c76b"))
         act_health.setIcon(self._make_icon("fa6s.heart-pulse", "#ff9ea5"))
         act_putty.setIcon(self._make_icon("fa6s.window-restore"))
         act_termius.setIcon(self._make_icon("fa6s.square-terminal"))
 
     def _update_connection_label(self):
         if isinstance(self.backend, SshRemoteBackend) and self.backend.is_connected():
-            self.connection_label.setText(self.T["backend_ssh"])
-            self.connection_label.setToolTip(self.backend.describe())
-            self.connection_label.setStyleSheet(
-                "QLabel { color: #dff9ef; background: rgba(39,174,96,0.16); "
-                "border: 1px solid rgba(39,174,96,0.34); border-radius: 13px; "
-                "padding: 8px 14px; font-weight: 700; }"
+            profile = self._current_profile_data()
+            name = profile_display_name(profile)
+            accent = profile_accent(profile)
+            compact_name = name if len(name) <= 18 else name[:17].rstrip() + "…"
+            self.connection_label.setText(f"●  {compact_name}")
+            self.connection_label.setToolTip(
+                f"{name}\n{self.backend.describe()}\nRoot: {self.cfg.get('ssh_root') or '/'}"
             )
+            self.connection_label.setStyleSheet(
+                f"QLabel {{ color:{accent}; background-color:#191d1b; border:1px solid {accent}; "
+                "border-radius:10px; padding:7px 12px; font-weight:700; }"
+            )
+            self.setWindowTitle(f"{APP_NAME} - {name}")
             self._update_taskbar_connection(True)
         else:
-            self.connection_label.setText(self.T["backend_idle"])
+            self.connection_label.setText("●  OFFLINE")
             self.connection_label.setToolTip("No active remote server connection")
-            self.connection_label.setStyleSheet(
-                "QLabel { color: #f7e7b3; background: rgba(244,199,107,0.12); "
-                "border: 1px solid rgba(244,199,107,0.26); border-radius: 13px; "
-                "padding: 8px 14px; font-weight: 700; }"
-            )
+            self.connection_label.setStyleSheet(OFFLINE_PILL_STYLE)
+            self.setWindowTitle(APP_NAME)
             self._update_taskbar_connection(False)
+        self._rebuild_server_tabs()
+
+    def _handle_connection_state(self, state: str, detail: str = ""):
+        if state == "reconnecting":
+            self.connection_label.setText("⟳  RECONNECTING")
+            self.connection_label.setToolTip(detail or "Restoring the SSH connection…")
+            self.connection_label.setStyleSheet(OFFLINE_PILL_STYLE)
+            if self.cfg.get("ssh_host") and self.cfg.get("ssh_username"):
+                self.setWindowTitle(f"{APP_NAME} - {profile_display_name(self._current_profile_data())} (Offline)")
+            else:
+                self.setWindowTitle(APP_NAME)
+            self._update_taskbar_connection(False)
+            return
+        self._update_connection_label()
+        self._update_discord_presence()
+        if state == "connected":
+            self.show_toast("SSH connection restored", "fa6s.link", "#8bc7a8")
+        elif state == "offline":
+            self.show_toast(
+                "SSH reconnect failed. Check the server or connect manually.",
+                "fa6s.plug-circle-xmark",
+                "#e58f98",
+            )
+
+    def _update_discord_presence(self):
+        if not hasattr(self, "discord_rpc"):
+            return
+        if isinstance(self.backend, SshRemoteBackend) and self.backend.is_connected():
+            profile_name = profile_display_name(self._current_profile_data())
+            self.discord_rpc.update(
+                "Browsing remote files",
+                f"Connected to {profile_name}",
+            )
+        else:
+            self.discord_rpc.update("Idle in dashboard", APP_VERSION)
+
+    def _verify_ssh_host_key(self, hostname: str, algorithm: str, fingerprint: str) -> bool:
+        message = (
+            "This server has not been trusted by Xyra yet.\n\n"
+            f"Server: {hostname}\n"
+            f"Key type: {algorithm}\n"
+            f"Fingerprint: {fingerprint}\n\n"
+            "Compare this fingerprint with the value shown by your hosting provider "
+            "or server administrator. Only trust it when it matches exactly."
+        )
+        answer = QMessageBox.question(
+            self,
+            "Verify SSH host key",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _create_ssh_backend(self, config: dict | None = None) -> SshRemoteBackend:
+        return SshRemoteBackend(
+            config or self.cfg,
+            host_key_verifier=self._verify_ssh_host_key,
+        )
+
+    def _prepare_server_switch(self, target_profile: dict) -> bool:
+        target_id = profile_identity(target_profile)
+        active_id = getattr(self, "_active_server_id", "")
+        switching_server = bool(active_id) and target_id != active_id
+
+        if switching_server and self._active_external_opens:
+            self.show_toast(
+                "Please wait until files currently opening have finished before switching servers.",
+                "fa6s.hourglass-half",
+                "#dfb86d",
+            )
+            return False
+
+        counts = self.transfer_queue.counts()
+        has_transfers = counts["active"] + counts["queued"] > 0
+        if has_transfers:
+            answer = QMessageBox.question(
+                self,
+                "Switch server",
+                "Switching servers will cancel all running and queued transfers.\n\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+
+        if switching_server:
+            for editor in list(self.open_editors):
+                try:
+                    if not editor.close():
+                        self.show_toast("Server switch cancelled: an editor still has unsaved changes.")
+                        return False
+                except RuntimeError:
+                    self._on_editor_destroyed(editor)
+
+        self._save_current_server_workspace()
+        if has_transfers:
+            self.transfer_queue.cancel_all()
+        return True
+
+    def _activate_connected_backend(self, backend: SshRemoteBackend, data: dict) -> bool:
+        if not self._prepare_server_switch(data):
+            backend.disconnect()
+            return False
+
+        previous_backend = self.backend
+        self.cfg.update(data)
+        self.cfg["ssh_profile_name"] = data.get("ssh_profile_name") or data.get("profile_name") or ""
+        self.cfg["connection_mode"] = "ssh"
+        save_config(self.cfg)
+
+        self.backend = backend
+        if isinstance(previous_backend, SshRemoteBackend):
+            previous_backend.disconnect()
+
+        self._folder_load_generation += 1
+        self._editor_backup_paths.clear()
+        self._prepare_scene_reset()
+        self.current_items = []
+        self.item_by_name = {}
+        self._entry_by_name = {}
+        self.current_order = []
+        self.current_path = self._restore_server_workspace()
+        self.update_path_label()
+        self._update_connection_label()
+        self._update_discord_presence()
+        self.show_toast(self.T["ssh_connected"], "fa6s.plug-circle-check", "#53d18b")
+        self.load_folder(self.current_path)
+        return True
+
+    def _launch_profile_window(self, profile_name: str):
+        profile_name = (profile_name or "").strip()
+        if not profile_name:
+            return
+        if getattr(sys, "frozen", False):
+            command = [sys.executable, "--profile", profile_name]
+            workdir = os.path.dirname(sys.executable)
+        else:
+            command = [sys.executable, os.path.abspath(__file__), "--profile", profile_name]
+            workdir = os.path.dirname(os.path.abspath(__file__))
+        kwargs = {"cwd": workdir}
+        if sys.platform.startswith("win"):
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            subprocess.Popen(command, **kwargs)
+            self.show_toast(f"Opening {profile_name} in a new Xyra window…")
+        except Exception as exc:
+            QMessageBox.warning(self, "Open profile", str(exc))
 
     def _setup_backend(self, initial: bool = False):
         use_ssh = (self.cfg.get("connection_mode") == "ssh" and self.cfg.get("ssh_host") and self.cfg.get("ssh_username"))
         if use_ssh:
-            backend = SshRemoteBackend(self.cfg)
+            backend = self._create_ssh_backend()
             try:
                 backend.connect()
                 self.backend = backend
@@ -1070,843 +1661,306 @@ class RemoteDesktop(QMainWindow):
         else:
             self.backend = None
         self._update_connection_label()
+        self._update_discord_presence()
 
     def show_ssh_login_dialog(self):
         dlg = SSHLoginDialog(self.cfg, self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        self._rebuild_server_tabs()
+        if not accepted:
+            self._update_connection_label()
+            return False
 
         data = dlg.get_data()
-        self.cfg.update(data)
-        save_config(self.cfg)
+        already_connected = self._backend_is_connected()
+        active_identity = getattr(self, "_active_server_id", "")
+        if already_connected and profile_identity(data) == active_identity:
+            self.cfg.update(data)
+            save_config(self.cfg)
+            self._select_connected_server_session(data, force_new=True)
+            self._update_connection_label()
+            self.show_toast(
+                f"Opened {profile_display_name(data)} in a new tab",
+                "fa6s.clone",
+                profile_accent(data),
+            )
+            return True
 
-        backend = SshRemoteBackend(self.cfg)
+        backend = self._create_ssh_backend(data)
         try:
             backend.connect()
         except Exception as e:
             QMessageBox.warning(self, self.T["ssh_connect_failed"], str(e))
-            return
+            return False
 
-        if isinstance(self.backend, SshRemoteBackend):
-            self.backend.disconnect()
+        if not self._activate_connected_backend(backend, data):
+            return False
+        self._select_connected_server_session(
+            data,
+            force_new=already_connected,
+            capture_current=False,
+        )
+        return True
 
-        self.backend = backend
-        self._update_connection_label()
-        self.show_toast(self.T["ssh_connected"], "fa6s.plug-circle-check", "#53d18b")
-        self.refresh_session()
-
-    def connect_ssh_profile(self, profile: dict):
+    def connect_ssh_profile(self, profile: dict) -> bool:
         data = dict(profile or {})
         if not data:
-            return
+            return False
         if not (data.get("ssh_host") or "").strip() or not (data.get("ssh_username") or "").strip():
             QMessageBox.warning(self, self.T["ssh_connect_failed"], "This saved profile is missing SSH host or username. Please edit and save it again.")
-            return
+            return False
 
-        self.cfg.update(data)
-        self.cfg["ssh_profile_name"] = data.get("profile_name", "")
-        self.cfg["connection_mode"] = "ssh"
-        save_config(self.cfg)
+        if (
+            self._backend_is_connected()
+            and profile_identity(data) == getattr(self, "_active_server_id", "")
+        ):
+            return True
 
-        backend = SshRemoteBackend(self.cfg)
+        connection_data = dict(data)
+        connection_data["ssh_profile_name"] = data.get("profile_name", "")
+        connection_data["ssh_profiles"] = self.cfg.get("ssh_profiles", [])
+        backend = self._create_ssh_backend(connection_data)
         try:
             backend.connect()
         except Exception as e:
             QMessageBox.warning(self, self.T["ssh_connect_failed"], str(e))
-            return
+            return False
 
-        if isinstance(self.backend, SshRemoteBackend):
-            self.backend.disconnect()
-
-        self.backend = backend
-        self._update_connection_label()
-        self.show_toast(self.T["ssh_connected"], "fa6s.plug-circle-check", "#53d18b")
-        self.refresh_session()
+        return self._activate_connected_backend(backend, connection_data)
 
     def disconnect_ssh(self):
+        self._capture_active_server_tab_state()
+        self._save_current_server_workspace()
         if isinstance(self.backend, SshRemoteBackend):
+            self.transfer_queue.cancel_all()
             self.backend.disconnect()
         self.cfg["connection_mode"] = "none"
         save_config(self.cfg)
         self.backend = None
+        collapsed_by_identity = {}
+        for session in self._server_tab_sessions:
+            identity = profile_identity(session["profile"])
+            if identity in self._dismissed_server_identities:
+                continue
+            existing = collapsed_by_identity.get(identity)
+            if existing is None or session.get("session_id") == self._active_server_session_id:
+                collapsed_by_identity[identity] = session
+        self._server_tab_sessions = list(collapsed_by_identity.values())
+        self._active_server_session_id = None
         self._update_connection_label()
+        self._update_discord_presence()
         self.show_toast(self.T["ssh_disconnected"], "fa6s.plug-circle-xmark", "#f4c76b")
         self.refresh_session()
 
+    def _require_backend(self) -> SshRemoteBackend:
+        backend = self.backend
+        if backend is None:
+            raise RuntimeError(self.DISCONNECTED_MESSAGE)
+        return backend
+
+    def _reconnect_backend(self, backend: SshRemoteBackend, observed_generation: int) -> bool:
+        with self._reconnect_lock:
+            if backend is not self.backend:
+                return False
+            if backend.connection_generation != observed_generation and backend.is_connected():
+                return True
+
+            self.connection_state_changed.emit("reconnecting", backend.describe())
+            last_error = ""
+            for delay in (0.0, 0.4, 1.0):
+                if backend is not self.backend:
+                    return False
+                if delay:
+                    time.sleep(delay)
+                try:
+                    backend.connect(allow_host_key_prompt=False)
+                    self.connection_state_changed.emit("connected", backend.describe())
+                    return True
+                except Exception as exc:
+                    last_error = str(exc)
+
+            self.connection_state_changed.emit("offline", last_error)
+            return False
+
+    def _schedule_backend_reconnect(self, backend: SshRemoteBackend, observed_generation: int):
+        threading.Thread(
+            target=self._reconnect_backend,
+            args=(backend, observed_generation),
+            name="xyra-ssh-reconnect",
+            daemon=True,
+        ).start()
+
+    def _backend_read_call(self, operation, *, backend: SshRemoteBackend | None = None):
+        active = backend or self._require_backend()
+        observed_generation = active.connection_generation
+        try:
+            with getattr(active, "operation_lock", nullcontext()):
+                return operation(active)
+        except Exception as exc:
+            if not active.is_connection_error(exc):
+                raise
+
+            if QThread.currentThread() == self.thread():
+                self._schedule_backend_reconnect(active, observed_generation)
+                raise RuntimeError(
+                    "The SSH connection was interrupted. Xyra is reconnecting; try again shortly."
+                ) from exc
+
+            if not self._reconnect_backend(active, observed_generation):
+                raise RuntimeError("The SSH connection was lost and could not be restored.") from exc
+            try:
+                with getattr(active, "operation_lock", nullcontext()):
+                    return operation(active)
+            except Exception as retry_error:
+                if active.is_connection_error(retry_error):
+                    self.connection_state_changed.emit("offline", str(retry_error))
+                raise
+
+    def _backend_write_call(self, operation):
+        active = self._require_backend()
+        observed_generation = active.connection_generation
+        try:
+            with getattr(active, "operation_lock", nullcontext()):
+                return operation(active)
+        except Exception as exc:
+            if not active.is_connection_error(exc):
+                raise
+            if QThread.currentThread() == self.thread():
+                self._schedule_backend_reconnect(active, observed_generation)
+            else:
+                self._reconnect_backend(active, observed_generation)
+            raise RuntimeError(
+                "The SSH connection was interrupted. For safety, Xyra did not retry this change automatically."
+            ) from exc
+
     def _backend_list_dir(self, path: str):
-        if self.backend is None:
-            raise RuntimeError("Not connected. Use 'Remote' -> 'Connect Server...'.")
-        return self.backend.list_dir(path)
+        return self._backend_read_call(lambda backend: backend.list_dir(path))
 
     def _backend_read_bytes(self, remote_path: str) -> bytes:
-        return self.backend.read_bytes(remote_path)
+        return self._backend_read_call(lambda backend: backend.read_bytes(remote_path))
 
     def _backend_write_text(self, remote_path: str, content: str):
-        self.backend.write_text(remote_path, content)
+        self._backend_write_call(lambda backend: backend.write_text(remote_path, content))
 
     def _backend_backup_file(self, remote_path: str):
-        return self.backend.backup_file(remote_path)
+        return self._backend_write_call(lambda backend: backend.backup_file(remote_path))
 
     def _backend_mkdir(self, remote_path: str):
-        self.backend.mkdir(remote_path)
+        self._backend_write_call(lambda backend: backend.mkdir(remote_path))
 
     def _backend_delete(self, remote_path: str):
-        self.backend.delete_path(remote_path)
+        self._backend_write_call(lambda backend: backend.delete_path(remote_path))
 
     def _backend_trash(self, remote_path: str):
-        return self.backend.trash_path(remote_path)
+        return self._backend_write_call(lambda backend: backend.trash_path(remote_path))
 
-    def _backend_rename(self, old_path: str, new_path: str):
-        self.backend.rename(old_path, new_path)
+    def _backend_list_trash(self):
+        return self._backend_read_call(lambda backend: backend.list_trash_items())
+
+    def _backend_restore_trash(self, trash_path: str, original_path: str, *, overwrite: bool = False):
+        self._backend_write_call(
+            lambda backend: backend.restore_trash_item(trash_path, original_path, overwrite=True)
+            if overwrite else backend.restore_trash_item(trash_path, original_path)
+        )
+
+    def _backend_delete_trash(self, trash_path: str):
+        self._backend_write_call(lambda backend: backend.delete_trash_item(trash_path))
+
+    def _backend_empty_trash(self):
+        self._backend_write_call(lambda backend: backend.empty_trash())
+
+    def _backend_rename(self, old_path: str, new_path: str, *, overwrite: bool = False):
+        self._backend_write_call(
+            lambda backend: backend.rename(old_path, new_path, overwrite=True)
+            if overwrite else backend.rename(old_path, new_path)
+        )
 
     def _backend_upload_file(self, local_path: str, remote_dir: str):
-        self.backend.upload_file(local_path, remote_dir)
+        self._backend_write_call(lambda backend: backend.upload_file(local_path, remote_dir))
 
-    def _backend_download_file(self, remote_path: str, local_path: str):
-        self.backend.download_file(remote_path, local_path)
+    def _backend_upload_path(self, local_path: str, remote_dir: str):
+        self._backend_write_call(lambda backend: backend.upload_path(local_path, remote_dir))
 
-    def _backend_copy(self, source_path: str, dest_path: str):
-        self.backend.copy_path(source_path, dest_path)
+    def _backend_upload_path_with_options(self, local_path: str, remote_dir: str, *, overwrite: bool = False, progress_callback=None, cancel_callback=None):
+        self._backend_write_call(lambda backend: backend.upload_path(remote_dir=remote_dir, local_path=local_path, overwrite=overwrite, progress_callback=progress_callback, cancel_callback=cancel_callback))
 
-    def _backend_move(self, source_path: str, dest_path: str):
-        self.backend.move_path(source_path, dest_path)
+    def _backend_download_file(self, remote_path: str, local_path: str, *, overwrite: bool = False, progress_callback=None, cancel_callback=None):
+        return self._backend_read_call(
+            lambda backend: backend.download_file(
+                remote_path, local_path, overwrite=True,
+                progress_callback=progress_callback, cancel_callback=cancel_callback,
+            ) if overwrite else backend.download_file(
+                remote_path, local_path,
+                progress_callback=progress_callback, cancel_callback=cancel_callback,
+            )
+        )
+
+    def _backend_copy(self, source_path: str, dest_path: str, *, overwrite: bool = False):
+        self._backend_write_call(
+            lambda backend: backend.copy_path(source_path, dest_path, overwrite=True)
+            if overwrite else backend.copy_path(source_path, dest_path)
+        )
+
+    def _backend_move(self, source_path: str, dest_path: str, *, overwrite: bool = False):
+        self._backend_write_call(
+            lambda backend: backend.move_path(source_path, dest_path, overwrite=True)
+            if overwrite else backend.move_path(source_path, dest_path)
+        )
 
     def _backend_extract_archive(self, archive_path: str, dest_dir: str):
-        self.backend.extract_archive(archive_path, dest_dir)
+        self._backend_write_call(lambda backend: backend.extract_archive(archive_path, dest_dir))
 
     def _backend_compress_zip(self, source_path: str, archive_path: str):
-        self.backend.compress_to_zip(source_path, archive_path)
+        self._backend_write_call(lambda backend: backend.compress_to_zip(source_path, archive_path))
 
     def _backend_get_path_info(self, remote_path: str):
-        return self.backend.get_path_info(remote_path)
+        return self._backend_read_call(lambda backend: backend.get_path_info(remote_path))
 
     def _backend_chmod(self, remote_path: str, mode_text: str):
-        self.backend.chmod_path(remote_path, mode_text)
+        self._backend_write_call(lambda backend: backend.chmod_path(remote_path, mode_text))
+
+    def _backend_change_permissions(
+        self,
+        remote_path: str,
+        mode_text: str,
+        *,
+        owner: str = "",
+        group: str = "",
+        recursive: bool = False,
+        file_mode_text: str = "",
+    ):
+        return self._backend_write_call(
+            lambda backend: backend.change_permissions(
+                remote_path,
+                mode_text,
+                owner=owner,
+                group=group,
+                recursive=recursive,
+                file_mode_text=file_mode_text,
+            )
+        )
+
+    def _backend_compute_checksums(self, remote_path: str):
+        return self._backend_read_call(lambda backend: backend.compute_checksums(remote_path))
 
     def _backend_search_files(self, start_path: str, query: str, max_depth: int, cancel_callback=None):
-        return self.backend.search_files(start_path, query, max_depth=max_depth, cancel_callback=cancel_callback)
+        return self._backend_read_call(lambda backend: backend.search_files(start_path, query, max_depth=max_depth, cancel_callback=cancel_callback))
+
+    def _backend_path_info_or_none(self, remote_path: str):
+        try:
+            return self._backend_get_path_info(remote_path)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            if getattr(exc, "errno", None) == 2 or "no such file" in str(exc).lower():
+                return None
+            raise
 
     def _backend_server_health(self):
-        if self.backend is None:
-            raise RuntimeError(self.DISCONNECTED_MESSAGE)
-        return self.backend.get_server_health(self.current_path)
+        return self._backend_read_call(lambda backend: backend.get_server_health(self.current_path))
 
-    def show_server_health(self):
-        if self.backend is None:
-            QMessageBox.warning(self, self.T["server_health_title"], self.DISCONNECTED_MESSAGE)
-            return
-        if self._remote_job_active or self._remote_search_active:
-            self.show_toast(self.T["remote_job_busy"], "fa6s.hourglass-half", "#f4c76b")
-            return
-
-        self._remote_job_active = True
-        self._show_upload_overlay(self.T["server_health_checking"])
-
-        def worker():
-            try:
-                report = self._backend_server_health()
-                self.server_health_done.emit(report)
-            except Exception as e:
-                self.server_health_failed.emit(str(e))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _show_server_health_dialog(self, report: str):
-        self._remote_job_active = False
-        self._hide_upload_overlay()
-
-        def first_value(prefix: str, default: str = "Unknown") -> str:
-            marker = f"{prefix}:"
-            lines = (report or "").splitlines()
-            for index, line in enumerate(lines):
-                if line.startswith(marker):
-                    value = line[len(marker):].strip()
-                    if not value:
-                        for candidate in lines[index + 1:]:
-                            candidate = candidate.strip()
-                            if candidate:
-                                return candidate
-                    return value or default
-            return default
-
-        def first_disk_row(section_title: str) -> str:
-            lines = (report or "").splitlines()
-            for index, line in enumerate(lines):
-                if line.strip() == section_title:
-                    for candidate in lines[index + 1:]:
-                        if not candidate.strip():
-                            break
-                        if candidate.startswith("Filesystem"):
-                            continue
-                        parts = candidate.split()
-                        if len(parts) >= 5:
-                            return f"{parts[4]} used, {parts[3]} free"
-            return "Unknown"
-
-        def make_card(title_text: str, value_text: str, accent: str):
-            card = QLabel(
-                f"<div style='color:{accent};font-size:11px;font-weight:700;letter-spacing:0.4px'>{title_text}</div>"
-                f"<div style='color:#f4f7fb;font-size:16px;font-weight:800;margin-top:4px'>{value_text}</div>"
-            )
-            card.setTextFormat(Qt.TextFormat.RichText)
-            card.setMinimumHeight(74)
-            card.setStyleSheet(
-                "QLabel { background: rgba(255,255,255,0.055); "
-                "border: 1px solid rgba(255,255,255,0.10); border-radius: 14px; padding: 12px; }"
-            )
-            return card
-
-        host = first_value("Host")
-        user = first_value("User")
-        xyra_path = first_value("Xyra path", "/")
-        load = first_value("Load")
-        memory = first_value("Memory")
-        disk = first_disk_row("Disk for current path:")
-        uptime = first_value("Uptime")
-        system = first_value("System")
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle(self.T["server_health_title"])
-        dlg.resize(820, 620)
-        dlg.setStyleSheet("""
-            QDialog { background: rgb(14,18,26); color: #eef3f9; }
-            QLabel { color: #eef3f9; }
-            QPlainTextEdit {
-                color: #dbe7f5;
-                background: rgba(255,255,255,0.045);
-                border: 1px solid rgba(255,255,255,0.10);
-                border-radius: 14px;
-                padding: 12px;
-                font-family: Consolas, "Cascadia Mono", monospace;
-                font-size: 12px;
-            }
-            QPlainTextEdit:hover {
-                border-color: rgba(110,168,255,0.24);
-            }
-            QToolButton {
-                color: #eef3f9;
-                background: rgba(255,255,255,0.08);
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 10px;
-                padding: 8px 14px;
-            }
-            QToolButton:hover {
-                background: rgba(110,168,255,0.16);
-                border-color: rgba(110,168,255,0.34);
-            }
-        """)
-        if os.path.exists(APP_ICON_PATH):
-            dlg.setWindowIcon(QIcon(APP_ICON_PATH))
-
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(18, 18, 18, 16)
-        layout.setSpacing(14)
-
-        title = QLabel(
-            f"<div style='font-size:20px;font-weight:900'>{self.T['server_health_title']}</div>"
-            f"<div style='color:#97aac2;font-size:12px'>Read-only snapshot for the active SSH server.</div>"
-        )
-        title.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(title)
-
-        card_row_one = QHBoxLayout()
-        card_row_one.setSpacing(10)
-        card_row_one.addWidget(make_card("HOST", host, "#7df0c1"))
-        card_row_one.addWidget(make_card("USER", user, "#8bd3ff"))
-        card_row_one.addWidget(make_card("DISK", disk, "#f4c76b"))
-        layout.addLayout(card_row_one)
-
-        card_row_two = QHBoxLayout()
-        card_row_two.setSpacing(10)
-        card_row_two.addWidget(make_card("LOAD", load, "#ff9ea5"))
-        card_row_two.addWidget(make_card("MEMORY", memory, "#caa9ff"))
-        card_row_two.addWidget(make_card("PATH", xyra_path, "#b7f7d8"))
-        layout.addLayout(card_row_two)
-
-        meta = QLabel(
-            f"<span style='color:#97aac2'>Uptime:</span> {uptime}<br>"
-            f"<span style='color:#97aac2'>System:</span> {system}"
-        )
-        meta.setTextFormat(Qt.TextFormat.RichText)
-        meta.setWordWrap(True)
-        meta.setStyleSheet(
-            "QLabel { background: rgba(255,255,255,0.035); "
-            "border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 10px 12px; }"
-        )
-        layout.addWidget(meta)
-
-        raw_label = QLabel("<b>Raw report</b>")
-        raw_label.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(raw_label)
-
-        report_box = QPlainTextEdit()
-        report_box.setReadOnly(True)
-        report_box.setPlainText(report or "No health data returned.")
-        layout.addWidget(report_box, 1)
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        btn_copy = QToolButton()
-        btn_copy.setText(self.T["copy_report"])
-        btn_close = QToolButton()
-        btn_close.setText(self.T["about_close"])
-        btn_row.addWidget(btn_copy)
-        btn_row.addWidget(btn_close)
-        layout.addLayout(btn_row)
-
-        btn_copy.clicked.connect(lambda: QApplication.clipboard().setText(report_box.toPlainText()))
-        btn_close.clicked.connect(dlg.accept)
-        dlg.exec()
-
-    def _finish_server_health_error(self, error_text: str):
-        self._remote_job_active = False
-        self._hide_upload_overlay()
-        QMessageBox.warning(self, self.T["server_health_title"], f"{self.T['server_health_failed']}:\n{error_text}")
-
-    # ---------------- Search ----------------
-    def _focus_search(self):
-        self.search_box.setFocus()
-        self.search_box.selectAll()
-
-    def _on_search_changed(self, text: str):
-        self.search_query = (text or "").strip()
-        self._search_timer.start()
-
-    def start_remote_search(self):
-        if self.backend is None:
-            QMessageBox.warning(self, self.T["remote_search_title"], self.DISCONNECTED_MESSAGE)
-            return
-        if self._remote_job_active or self._remote_search_active:
-            self.show_toast(self.T["remote_job_busy"], "fa6s.hourglass-half", "#f4c76b")
-            return
-
-        query = (self.search_box.text() or "").strip()
-        if not query:
-            query, ok = QInputDialog.getText(self, self.T["remote_search_title"], self.T["remote_search_prompt"])
-            if not ok:
-                return
-            query = (query or "").strip()
-        if not query:
-            return
-
-        max_depth, ok = QInputDialog.getInt(self, self.T["remote_search_title"], self.T["remote_search_depth"], 4, 0, 12, 1)
-        if not ok:
-            return
-
-        self._remote_search_id += 1
-        search_id = self._remote_search_id
-        self._remote_search_active = True
-        self._remote_search_cancel_requested = False
-        self._show_search_overlay(
-            self.T["remote_searching"].format(query=query),
-            self.T["remote_search_info"],
-        )
-
-        start_path = self.current_path
-
-        def worker():
-            try:
-                def should_cancel():
-                    return self._remote_search_cancel_requested or search_id != self._remote_search_id
-
-                results = self._backend_search_files(start_path, query, max_depth, cancel_callback=should_cancel)
-                self.remote_search_done.emit(search_id, query, results)
-            except Exception as e:
-                self.remote_search_failed.emit(search_id, str(e))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def cancel_remote_search(self):
-        if not self._remote_search_active:
-            return
-        self._remote_search_cancel_requested = True
-        self._remote_search_id += 1
-        self._remote_search_active = False
-        self._hide_search_overlay()
-        self.show_toast(self.T["remote_search_cancelled"], "fa6s.circle-xmark", "#f4c76b")
-
-    def _finish_remote_search_error(self, search_id: int, error_text: str):
-        if search_id != self._remote_search_id:
-            return
-        self._remote_search_active = False
-        self._hide_search_overlay()
-        if "cancel" in (error_text or "").lower():
-            self.show_toast(self.T["remote_search_cancelled"], "fa6s.circle-xmark", "#f4c76b")
-            return
-        QMessageBox.warning(self, self.T["remote_search_title"], f"{self.T['remote_search_failed']}:\n{error_text}")
-
-    def _show_remote_search_results(self, search_id: int, query: str, results: list):
-        if search_id != self._remote_search_id:
-            return
-        self._remote_search_active = False
-        self._hide_search_overlay()
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"{self.T['remote_search_results']} - {query}")
-        dlg.resize(780, 520)
-        dlg.setStyleSheet("""
-            QDialog { background: rgba(14,18,26,0.98); color: #eef3f9; }
-            QLabel { color: #eef3f9; }
-            QListWidget {
-                color: #e8eef7;
-                background: rgba(255,255,255,0.05);
-                border: 1px solid rgba(255,255,255,0.10);
-                border-radius: 14px;
-                padding: 10px;
-                outline: 0;
-                selection-background-color: transparent;
-            }
-            QListWidget::item {
-                min-height: 28px;
-                padding: 5px 10px;
-                margin: 0px;
-                border-radius: 8px;
-                border: 1px solid transparent;
-            }
-            QListWidget::item:hover {
-                background: rgba(255,255,255,0.07);
-                border-color: rgba(255,255,255,0.10);
-            }
-            QListWidget::item:selected,
-            QListWidget::item:selected:active,
-            QListWidget::item:selected:!active {
-                color: #f7fbff;
-                background: rgba(110,168,255,0.24);
-                border-color: rgba(110,168,255,0.42);
-            }
-            QToolButton {
-                color: #eef3f9;
-                background: rgba(255,255,255,0.08);
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 10px;
-                padding: 8px 14px;
-            }
-            QToolButton:hover { background: rgba(110,168,255,0.16); border-color: rgba(110,168,255,0.34); }
-        """)
-
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
-
-        title = QLabel(f"<b>{len(results)}</b> result(s) for <b>{query}</b> from {self._display_server_path(self.current_path)}")
-        title.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(title)
-
-        hint = QLabel(self.T["remote_search_hint"] if results else self.T["remote_search_empty"])
-        hint.setStyleSheet("color: #93a5ba;")
-        layout.addWidget(hint)
-
-        result_list = QListWidget()
-        result_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        for result in results:
-            path = normalize_api_path(result.get("path", "."))
-            label = self._display_server_path(path)
-            if result.get("isDir"):
-                label += "  [folder]"
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, result)
-            item.setIcon(self._make_icon("fa6s.folder", "#f4c76b") if result.get("isDir") else self._make_icon("fa6s.file-lines", "#8bd3ff"))
-            item.setSizeHint(QSize(0, 34))
-            result_list.addItem(item)
-        layout.addWidget(result_list, 1)
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        btn_copy = QToolButton()
-        btn_copy.setText(self.T["remote_search_copy_path"])
-        btn_open = QToolButton()
-        btn_open.setText(self.T["remote_search_open_folder"])
-        btn_close = QToolButton()
-        btn_close.setText(self.T["about_close"])
-        btn_row.addWidget(btn_copy)
-        btn_row.addWidget(btn_open)
-        btn_row.addWidget(btn_close)
-        layout.addLayout(btn_row)
-
-        def selected_result():
-            item = result_list.currentItem()
-            return item.data(Qt.ItemDataRole.UserRole) if item else None
-
-        def open_selected():
-            result = selected_result()
-            if not result:
-                return
-            target = normalize_api_path(result.get("path", ".") if result.get("isDir") else result.get("parent", "."))
-            dlg.accept()
-            self._navigate_to_path(target)
-
-        def copy_selected():
-            result = selected_result()
-            if not result:
-                return
-            self._copy_remote_path_to_clipboard(result.get("path", "."))
-
-        result_list.itemDoubleClicked.connect(lambda _: open_selected())
-        btn_open.clicked.connect(open_selected)
-        btn_copy.clicked.connect(copy_selected)
-        btn_close.clicked.connect(dlg.accept)
-        dlg.exec()
-
-    # ---------------- Path badge ----------------
-    def update_path_label(self):
-        p = normalize_api_path(self.current_path)
-        text = "/" if p in (".", "") else ("/" + p)
-        self.path_badge.setText(text)
-        self.path_badge.setToolTip(f"{self.T['path_menu']}: {text}")
-        if hasattr(self, "task_path_label"):
-            self.task_path_label.setText(text)
-            self.task_path_label.setToolTip(f"{self.T['path_menu']}: {text}")
-        self._reposition_path_badge()
-
-    def _show_path_badge_menu(self, event, anchor_widget=None):
-        menu = QMenu(self)
-        current = normalize_api_path(self.current_path)
-
-        for label, path in self._breadcrumb_paths(current):
-            action = menu.addAction(f"{self.T['go_to']} {label}")
-            action.setIcon(self._make_icon("fa6s.folder-open", "#8bd3ff"))
-            action.triggered.connect(lambda checked=False, p=path: self._navigate_to_path(p))
-
-        menu.addSeparator()
-        act_copy = menu.addAction(self.T["copy_current_path"])
-        act_copy.setIcon(self._make_icon("fa6s.copy", "#8bd3ff"))
-        act_start = menu.addAction(self.T["set_start_path"])
-        act_start.setIcon(self._make_icon("fa6s.location-dot", "#f4c76b"))
-        favorites = self._clean_saved_paths(self.cfg.get("favorites", []), limit=50)
-        act_favorite = menu.addAction(self.T["remove_favorite"] if current in favorites else self.T["add_favorite"])
-        act_favorite.setIcon(self._make_icon("fa6s.star", "#f4c76b"))
-
-        if anchor_widget is not None:
-            chosen = self._exec_menu_above_widget(menu, anchor_widget)
-        else:
-            chosen = menu.exec(event.globalPosition().toPoint())
-        if chosen == act_copy:
-            self._copy_remote_path_to_clipboard(self.current_path)
-        elif chosen == act_start:
-            self._set_current_path_as_start()
-        elif chosen == act_favorite:
-            self._toggle_favorite_path(self.current_path)
-
-    def _breadcrumb_paths(self, path: str):
-        norm = normalize_api_path(path)
-        crumbs = [("/", ".")]
-        if norm in ("", "."):
-            return crumbs
-
-        parts = [part for part in norm.split("/") if part]
-        cur_parts = []
-        for part in parts:
-            cur_parts.append(part)
-            crumb_path = "/".join(cur_parts)
-            crumbs.append(("/" + crumb_path, crumb_path))
-        return crumbs
-
-    def _reposition_path_badge(self):
-        if hasattr(self, "path_badge") and not self.path_badge.isVisible():
-            return
-        vp = self.view.viewport().rect()
-        self.path_badge.adjustSize()
-        w = self.path_badge.width()
-        h = self.path_badge.height()
-        x = max(0, (vp.width() - w) // 2)
-        taskbar_h = self.taskbar.height() + 22 if hasattr(self, "taskbar") else 0
-        y = max(0, vp.height() - h - taskbar_h - 14)
-        self.path_badge.setGeometry(x, y, w, h)
-        self.path_badge.raise_()
-
-    def _reposition_version_badge(self):
-        if hasattr(self, "version_badge") and not self.version_badge.isVisible():
-            return
-        vp = self.view.viewport().rect()
-        self.version_badge.adjustSize()
-        w = self.version_badge.width()
-        h = self.version_badge.height()
-        x = max(0, vp.width() - w - 14)
-        taskbar_h = self.taskbar.height() + 22 if hasattr(self, "taskbar") else 0
-        y = max(0, vp.height() - h - taskbar_h - 14)
-        self.version_badge.setGeometry(x, y, w, h)
-        self.version_badge.raise_()
-
-    def _show_center_message(self, text: str):
-        self.center_message.setText(text)
-        self.center_message.adjustSize()
-        vp = self.view.viewport().rect()
-        w = min(max(self.center_message.width(), 320), max(320, vp.width() - 80))
-        h = self.center_message.height()
-        x = max(20, (vp.width() - w) // 2)
-        y = max(70, (vp.height() - h) // 2)
-        self.center_message.setGeometry(x, y, w, h)
-        self.center_message.show()
-        self.center_message.raise_()
-
-    def _hide_center_message(self):
-        self.center_message.hide()
-
-    # ---------------- About ----------------
-    def show_about_dialog(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"{APP_NAME} - {self.T['about_title']}")
-        dlg.setModal(True)
-        dlg.setFixedSize(460, 430)
-        dlg.setStyleSheet("""
-            QDialog { background: rgb(14,18,26); }
-            QLabel { color: #eef3f9; }
-            QToolButton {
-                color: #eef3f9;
-                background: rgba(255,255,255,0.08);
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 10px;
-                padding: 8px 14px;
-            }
-            QToolButton:hover {
-                background: rgba(110,168,255,0.16);
-                border: 1px solid rgba(110,168,255,0.34);
-            }
-        """)
-        if os.path.exists(APP_ICON_PATH):
-            dlg.setWindowIcon(QIcon(APP_ICON_PATH))
-
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(14)
-
-        logo_lbl = QLabel()
-        logo_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo_pm = QPixmap(APP_LOGO_PATH) if os.path.exists(APP_LOGO_PATH) else QPixmap()
-        if not logo_pm.isNull():
-            logo_lbl.setPixmap(
-                logo_pm.scaled(132, 132, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            )
-        else:
-            logo_lbl.setText("X")
-            logo_lbl.setStyleSheet("color: rgba(255,255,255,0.5); font-size: 42px;")
-            logo_lbl.setFixedHeight(90)
-        layout.addWidget(logo_lbl)
-
-        title = QLabel(
-            f"<div style='text-align:center'>"
-            f"<b style='font-size:22px'>{APP_NAME}</b><br>"
-            f"<span style='color:#97aac2;font-size:12px'>Remote Linux file dashboard</span>"
-            f"</div>"
-        )
-        title.setTextFormat(Qt.TextFormat.RichText)
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
-
-        info = QLabel(
-            f"<div style='color:white; line-height:1.55'>"
-            f"<b>Developer:</b> {APP_DEVELOPER}<br>"
-            f"<b>Version:</b> {APP_VERSION}<br>"
-            f"<b>Contributors:</b> {APP_CONTRIBUTORS}<br>"
-            f"<b>Website:</b> SOON...</a>"
-            f"</div>"
-        )
-        info.setOpenExternalLinks(True)
-        info.setTextFormat(Qt.TextFormat.RichText)
-        info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(info)
-
-        layout.addStretch()
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        btn_close = QToolButton()
-        btn_close.setText(self.T["about_close"])
-        btn_close.clicked.connect(dlg.accept)
-        btn_row.addWidget(btn_close)
-        layout.addLayout(btn_row)
-
-        dlg.exec()
-
-    # ---------------- EMPTY SPACE context menu (Create folder/file) ----------------
-    def show_empty_context_menu(self, global_pos):
-        menu = QMenu(self)
-        act_refresh = menu.addAction(self.T["refresh"])
-        act_refresh.setIcon(self._make_icon("fa6s.rotate-right", "#8bd3ff"))
-        menu.addSeparator()
-        act_copy_path = menu.addAction(self.T["copy_current_path"])
-        act_copy_path.setIcon(self._make_icon("fa6s.copy", "#8bd3ff"))
-        act_favorite = menu.addAction(self.T["add_favorite"])
-        act_favorite.setIcon(self._make_icon("fa6s.star", "#f4c76b"))
-        menu.addSeparator()
-        act_folder = menu.addAction(self.T["create_folder"])
-        act_file = menu.addAction(self.T["create_file"])
-
-        chosen = menu.exec(global_pos)
-        if chosen == act_refresh:
-            self.refresh_session()
-        elif chosen == act_copy_path:
-            self._copy_remote_path_to_clipboard(self.current_path)
-        elif chosen == act_favorite:
-            self._toggle_favorite_path(self.current_path)
-        elif chosen == act_folder:
-            self._create_folder_dialog()
-        elif chosen == act_file:
-            self._create_file_dialog()
-
-    def _create_folder_dialog(self):
-        name, ok = QInputDialog.getText(self, self.T["create_title"], self.T["name_prompt"])
-        if not ok:
-            return
-        name = (name or "").strip()
-        if not is_valid_new_name(name):
-            QMessageBox.warning(self, self.T["create_title"], self.T["rename_invalid"])
-            return
-
-        remote_path = join_server_path(self.current_path, name)
-
-        try:
-            self._backend_mkdir(remote_path)
-        except Exception as e:
-            QMessageBox.warning(self, self.T["create_title"], f"{self.T['create_failed']}:\n{e}")
-            return
-
-        self.load_folder(self.current_path)
-
-    def _create_file_dialog(self):
-        name, ok = QInputDialog.getText(self, self.T["create_title"], self.T["name_prompt"])
-        if not ok:
-            return
-        name = (name or "").strip()
-        if not is_valid_new_name(name):
-            QMessageBox.warning(self, self.T["create_title"], self.T["rename_invalid"])
-            return
-
-        remote_path = join_server_path(self.current_path, name)
-
-        try:
-            self._backend_write_text(remote_path, "")
-        except Exception as e:
-            QMessageBox.warning(self, self.T["create_title"], f"{self.T['create_failed']}:\n{e}")
-            return
-
-        self.load_folder(self.current_path)
 
     # ---------------- Drag & Drop Upload (FIXED) ----------------
-    def _has_local_files(self, event) -> bool:
-        md = event.mimeData()
-        if not md or not md.hasUrls():
-            return False
-        for u in md.urls():
-            if u.isLocalFile():
-                p = u.toLocalFile()
-                if p and os.path.exists(p):
-                    return True
-        return False
-
-    def _on_drag_enter(self, event):
-        if self._has_local_files(event):
-            event.setDropAction(Qt.DropAction.CopyAction)
-            event.accept()
-            self.drop_overlay.setGeometry(self.view.viewport().rect())
-            self.drop_overlay.show()
-            self.drop_overlay.raise_()
-            return
-        event.ignore()
-
-    def _on_drag_move(self, event):
-        if self._has_local_files(event):
-            event.setDropAction(Qt.DropAction.CopyAction)
-            event.accept()
-            return
-        event.ignore()
-
-    def _on_drag_leave(self, event):
-        self.drop_overlay.hide()
-        event.accept()
-
-    def _show_upload_overlay(self, text: str):
-        self.upload_overlay.setText(text)
-        self.upload_overlay.adjustSize()
-        vp = self.view.viewport().rect()
-        w = self.upload_overlay.width()
-        h = self.upload_overlay.height()
-        x = max(0, (vp.width() - w) // 2)
-        y = max(0, (vp.height() - h) // 2)
-        self.upload_overlay.setGeometry(x, y, w, h)
-        self.upload_overlay.show()
-        self.upload_overlay.raise_()
-        QApplication.processEvents()
-
-    def _hide_upload_overlay(self):
-        self.upload_overlay.hide()
-        self.search_cancel_button.hide()
-
-    def _show_search_overlay(self, title: str, info: str):
-        self.upload_overlay.setText(f"{title}\n{info}")
-        self.upload_overlay.setStyleSheet(
-            "QLabel { background: rgba(20,20,20,0.82); color: white; font-size: 17px; "
-            "border-radius: 16px; padding: 18px 24px; }"
-        )
-        self.upload_overlay.adjustSize()
-        vp = self.view.viewport().rect()
-        w = self.upload_overlay.width()
-        h = self.upload_overlay.height()
-        x = max(0, (vp.width() - w) // 2)
-        y = max(0, (vp.height() - h) // 2 - 20)
-        self.upload_overlay.setGeometry(x, y, w, h)
-        self.upload_overlay.show()
-        self.upload_overlay.raise_()
-
-        self.search_cancel_button.adjustSize()
-        btn_w = self.search_cancel_button.width()
-        btn_h = self.search_cancel_button.height()
-        self.search_cancel_button.setGeometry(
-            max(0, (vp.width() - btn_w) // 2),
-            min(vp.height() - btn_h, y + h + 12),
-            btn_w,
-            btn_h,
-        )
-        self.search_cancel_button.show()
-        self.search_cancel_button.raise_()
-        QApplication.processEvents()
-
-    def _hide_search_overlay(self):
-        self._hide_upload_overlay()
-        self.upload_overlay.setStyleSheet(
-            "QLabel { background: rgba(20,20,20,0.78); color: white; font-size: 18px; "
-            "border-radius: 16px; padding: 16px 22px; }"
-        )
-
-    def _upload_single_file(self, local_path: str) -> tuple[bool, str]:
-        try:
-            self._backend_upload_file(local_path, self.current_path)
-        except Exception as e:
-            return False, str(e)
-        return True, ""
-
-    def _on_drop(self, event):
-        self.drop_overlay.hide()
-
-        md = event.mimeData()
-        if not md or not md.hasUrls():
-            event.ignore()
-            return
-
-        local_files = []
-        for u in md.urls():
-            if u.isLocalFile():
-                p = u.toLocalFile()
-                if p and os.path.isfile(p):
-                    local_files.append(p)
-
-        if not local_files:
-            event.ignore()
-            return
-
-        event.setDropAction(Qt.DropAction.CopyAction)
-        event.accept()
-
-        for p in local_files:
-            self._show_upload_overlay(self.T["uploading"].format(file=os.path.basename(p), mb=mb_size(p)))
-            ok, err = self._upload_single_file(p)
-            if ok:
-                self.show_toast(self.T["uploaded"].format(file=os.path.basename(p)), "fa6s.cloud-arrow-up", "#53d18b")
-            else:
-                QMessageBox.warning(self, "Upload", f"{self.T['upload_failed']}:\n{os.path.basename(p)}\n\n{err}")
-
-        self._hide_upload_overlay()
-        self.load_folder(self.current_path)
 
     # ---------------- tool launching ----------------
     def _launch_tool(self, tool: str):
@@ -1978,1165 +2032,29 @@ class RemoteDesktop(QMainWindow):
             )
 
     # ---------------- icons ----------------
-    def _load_icons(self):
-        def pm(p):
-            return QPixmap(p) if p and os.path.exists(p) else QPixmap()
-
-        def icon_path(name: str) -> str:
-            pack_path = (self.cfg.get("icon_pack_path") or "").strip()
-            if pack_path:
-                candidate = os.path.join(pack_path, name)
-                if os.path.exists(candidate):
-                    return candidate
-            return resource_path("assets", "icons", name)
-
-        self.pm_folder = pm(icon_path("linux_folder.png"))
-        if self.pm_folder.isNull():
-            self.pm_folder = pm(icon_path("folder.png"))
-
-        self.pm_file = pm(icon_path("linux_file.png"))
-        if self.pm_file.isNull():
-            self.pm_file = pm(icon_path("file.png"))
-
-        self.pm_images = pm(icon_path("images.png"))
-        self.pm_archive = pm(icon_path("linux_archive.png"))
-
-        if self.pm_folder.isNull() and not self.pm_file.isNull():
-            self.pm_folder = self.pm_file
-
-    def _supported_icon_pack_files(self) -> set[str]:
-        return {
-            "linux_folder.png", "folder.png",
-            "linux_file.png", "file.png",
-            "images.png", "linux_archive.png",
-        }
-
-    def change_icon_pack(self):
-        answer = QMessageBox.information(
-            self,
-            self.T["icon_pack_info_title"],
-            self.T["icon_pack_info"],
-            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Ok,
-        )
-        if answer != QMessageBox.StandardButton.Ok:
-            return
-
-        start_dir = self.cfg.get("icon_pack_path") or os.path.expanduser("~")
-        folder = QFileDialog.getExistingDirectory(self, self.T["change_icon_pack"], start_dir)
-        if not folder:
-            return
-
-        supported = self._supported_icon_pack_files()
-        found = {
-            name.lower()
-            for name in os.listdir(folder)
-            if os.path.isfile(os.path.join(folder, name)) and name.lower() in supported
-        }
-        if not found:
-            QMessageBox.warning(self, self.T["change_icon_pack"], self.T["icon_pack_missing"])
-            return
-
-        self.cfg["icon_pack_path"] = folder
-        save_config(self.cfg)
-        self._load_icons()
-        self._render_folder_items()
-        self.show_toast(self.T["icon_pack_changed"], "fa6s.icons", "#f4c76b")
-
-    def reset_icon_pack(self):
-        if not self.cfg.get("icon_pack_path"):
-            return
-        self.cfg["icon_pack_path"] = ""
-        save_config(self.cfg)
-        self._load_icons()
-        self._render_folder_items()
-        self.show_toast(self.T["icon_pack_reset"], "fa6s.rotate-left", "#f4c76b")
-
-    def _pick_icon_for_entry(self, name: str, is_dir: bool) -> QPixmap:
-        if is_dir:
-            return self.pm_folder if not self.pm_folder.isNull() else self.pm_file
-        ext = split_ext(name)
-        if ext in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tga"}:
-            return self.pm_images if not self.pm_images.isNull() else self.pm_file
-        if self._is_archive_name(name):
-            return self.pm_archive if not self.pm_archive.isNull() else self.pm_file
-        return self.pm_file
-
-    # ---------------- background ----------------
-    def _update_background_pixmap(self):
-        if not self.bg_path or not os.path.exists(self.bg_path):
-            self.bg_pixmap = QPixmap()
-            self.view.viewport().update()
-            return
-
-        vw = max(1, self.view.viewport().width())
-        vh = max(1, self.view.viewport().height())
-
-        pm = QPixmap(self.bg_path)
-        if pm.isNull():
-            self.bg_pixmap = QPixmap()
-            self.view.viewport().update()
-            return
-
-        self.bg_pixmap = pm.scaled(
-            vw, vh,
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        self.view.viewport().update()
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        if self._did_first_show:
-            return
-        self._did_first_show = True
-        QTimer.singleShot(0, self._post_first_show_fix)
-
-    def _post_first_show_fix(self):
-        self._update_background_pixmap()
-        self._reposition_path_badge()
-        self._reposition_version_badge()
-        self._reposition_taskbar()
-        self._relayout_timer.start()
-
-    # ---------------- toast ----------------
-    def show_toast(self, text: str, icon_name: str = "fa6s.circle-info", color: str = "#8bd3ff"):
-        self.toast_text.setText(text)
-        icon = self._make_icon(icon_name, color)
-        pixmap = icon.pixmap(QSize(16, 16))
-        self.toast_icon.setPixmap(pixmap)
-        self.toast.adjustSize()
-
-        x_start = -self.toast.width()
-        y = self.toolbar.height() + 8
-        x_end = 10
-
-        self.toast.move(x_start, y)
-        self.toast.show()
-        self.toast.raise_()
-
-        anim = QPropertyAnimation(self.toast, b"pos", self)
-        anim.setDuration(380)
-        anim.setStartValue(QPoint(x_start, y))
-        anim.setEndValue(QPoint(x_end, y))
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.start()
-
-        self.toast_anim = anim
-        QTimer.singleShot(1400, self._hide_toast)
-
-    def _hide_toast(self):
-        if not self.toast.isVisible():
-            return
-        x_end = -self.toast.width()
-        y = self.toast.y()
-        x_start = self.toast.x()
-
-        anim = QPropertyAnimation(self.toast, b"pos", self)
-        anim.setDuration(320)
-        anim.setStartValue(QPoint(x_start, y))
-        anim.setEndValue(QPoint(x_end, y))
-        anim.setEasingCurve(QEasingCurve.Type.InCubic)
-        anim.finished.connect(self.toast.hide)
-        anim.start()
-        self.toast_anim = anim
-
-    def refresh_session(self):
-        self._save_order_for_current_folder()
-        self.load_folder(self.current_path)
-        self.show_toast(self.T["refreshed"])
-
-    def toggle_fullscreen(self):
-        if self.isFullScreen():
-            if self._was_maximized_before_fullscreen:
-                self.showMaximized()
-            else:
-                self.showNormal()
-            self.show_toast(self.T["fullscreen_off"], "fa6s.down-left-and-up-right-to-center", "#f4c76b")
-            return
-
-        self._was_maximized_before_fullscreen = self.isMaximized()
-        self.showFullScreen()
-        self.show_toast(self.T["fullscreen_on"], "fa6s.up-right-and-down-left-from-center", "#53d18b")
-
-    # ---------------- folder order persistence ----------------
-    def _folder_key(self) -> str:
-        return normalize_api_path(self.current_path)
-
-    def _get_saved_order(self, names: list[str]) -> list[str]:
-        key = self._folder_key()
-        bucket = self.icons_pos.get(key, {}) if isinstance(self.icons_pos, dict) else {}
-
-        if isinstance(bucket, dict) and isinstance(bucket.get("order"), list):
-            order = [n for n in bucket["order"] if n in names]
-            for n in names:
-                if n not in order:
-                    order.append(n)
-            return order
-
-        return names[:]
-
-    def _save_order_for_current_folder(self, order: list[str] | None = None):
-        # If searching/filtering, don't overwrite saved layout with a partial list
-        if (self.search_query or "").strip():
-            return
-
-        if order is None:
-            order = self.current_order[:]
-        key = self._folder_key()
-        if not isinstance(self.icons_pos, dict):
-            self.icons_pos = {}
-        self.icons_pos.setdefault(key, {})
-        if not isinstance(self.icons_pos[key], dict):
-            self.icons_pos[key] = {}
-        self.icons_pos[key]["order"] = order
-        save_icons_pos(self.icons_pos)
-
-    # ---------------- grid logic ----------------
-    def _grid_params(self, n_items: int) -> dict:
-        spacing_x = 160
-        spacing_y = 125
-        margin_x = 40
-        margin_y = 40
-        bottom_pad = 132
-
-        vw = max(220, self.view.viewport().width())
-        vh = max(220, self.view.viewport().height())
-
-        available_w = max(1, vw - 2 * margin_x)
-        cols = max(1, int(available_w // spacing_x))
-
-        rows = max(1, math.ceil(n_items / cols)) if cols > 0 else n_items
-        needed_h = rows * spacing_y + 2 * margin_y
-        scene_h = max(vh, needed_h + bottom_pad)
-
-        icon_scale = 1.0
-        if available_w < spacing_x:
-            icon_scale = max(0.82, available_w / float(spacing_x))
-
-        return dict(
-            vw=vw, vh=vh,
-            spacing_x=spacing_x, spacing_y=spacing_y,
-            margin_x=margin_x, margin_y=margin_y,
-            cols=cols, rows=rows,
-            icon_scale=icon_scale,
-            scene_h=scene_h
-        )
-
-    def _slot_pos(self, idx: int, gp: dict) -> QPointF:
-        col = idx % gp["cols"]
-        row = idx // gp["cols"]
-        x = gp["margin_x"] + col * gp["spacing_x"]
-        y = gp["margin_y"] + row * gp["spacing_y"]
-        return QPointF(float(x), float(y))
-
-    def _nearest_slot_index(self, pos: QPointF, gp: dict) -> int:
-        x = pos.x()
-        y = pos.y()
-
-        col = int(round((x - gp["margin_x"]) / gp["spacing_x"]))
-        row = int(round((y - gp["margin_y"]) / gp["spacing_y"]))
-
-        col = max(0, min(gp["cols"] - 1, col))
-        row = max(0, row)
-
-        idx = row * gp["cols"] + col
-        return max(0, idx)
-
-    def _relayout_to_order(self, gp: dict):
-        for i, name in enumerate(self.current_order):
-            it = self.item_by_name.get(name)
-            if not it:
-                continue
-            it.setBaseScale(gp["icon_scale"])
-            it.setPos(self._slot_pos(i, gp))
-
-        self.scene.setSceneRect(QRectF(0, 0, gp["vw"], gp["scene_h"]))
-        self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-
-    def _on_icon_released(self, item: IconItem):
-        if item.name not in self.current_order:
-            return
-
-        gp = self._grid_params(len(self.current_order))
-        idx = self._nearest_slot_index(item.pos(), gp)
-
-        old_idx = self.current_order.index(item.name)
-        if idx != old_idx:
-            self.current_order.pop(old_idx)
-            idx = min(idx, len(self.current_order))
-            self.current_order.insert(idx, item.name)
-
-        # enforce grouping after drag too (folders first)
-        self._enforce_folder_first_grouping()
-
-        self._relayout_to_order(gp)
-        self._save_order_for_current_folder()
-
-    def _selected_existing_names(self) -> list[str]:
-        return [name for name in self.current_order if name in self.selected_names and name in self.item_by_name]
-
-    def _sync_icon_selection(self):
-        existing = set(self.item_by_name.keys())
-        self.selected_names = {name for name in self.selected_names if name in existing}
-        for name, item in self.item_by_name.items():
-            item.setSelected(name in self.selected_names)
-            item.update()
-
-    def _select_icon_by_name(self, name: str, *, additive: bool = False):
-        if name not in self.item_by_name:
-            return
-        if additive:
-            if name in self.selected_names:
-                self.selected_names.remove(name)
-            else:
-                self.selected_names.add(name)
-        else:
-            self.selected_names = {name}
-        self._sync_icon_selection()
-
-    def _clear_icon_selection(self):
-        if not self.selected_names:
-            return
-        self.selected_names.clear()
-        self._sync_icon_selection()
-
-    def _select_all_icons(self):
-        self.selected_names = set(self.current_order)
-        self._sync_icon_selection()
-
-    def _primary_selected_name(self) -> str | None:
-        selected = self._selected_existing_names()
-        return selected[0] if selected else None
-
-    # ---------------- grouping helper (folders always first) ----------------
-    def _enforce_folder_first_grouping(self):
-        # uses current view's is_dir mapping
-        if not hasattr(self, "_is_dir_map") or not isinstance(self._is_dir_map, dict):
-            return
-        dirs = [n for n in self.current_order if self._is_dir_map.get(n, False)]
-        files = [n for n in self.current_order if not self._is_dir_map.get(n, False)]
-        self.current_order = dirs + files
-
-    def _rerender_current_folder(self):
-        self._render_folder_items()
-
-    def _render_folder_items(self):
-        if self.backend is None:
-            self.scene.clear()
-            self.item_by_name = {}
-            self.current_order = []
-            self.selected_names.clear()
-            self.scene.setSceneRect(QRectF(0, 0, self.view.viewport().width(), self.view.viewport().height()))
-            self._show_center_message(self.DISCONNECTED_MESSAGE)
-            return
-
-        items = list(self.current_items or [])
-
-        self.scene.clear()
-        self.item_by_name = {}
-        self.current_order = []
-
-        q = (self.search_query or "").strip().lower()
-        if q:
-            filtered = []
-            for e in items:
-                name = str(e.get("name", ""))
-                desc = str(e.get("desc", ""))
-                if q in name.lower() or q in desc.lower():
-                    filtered.append(e)
-            items = filtered
-
-        dirs_entries = [e for e in items if bool(e.get("isDir", False))]
-        file_entries = [e for e in items if not bool(e.get("isDir", False))]
-        item_entries = dirs_entries + file_entries
-
-        names_default = []
-        is_dir_map = {}
-        for e in item_entries:
-            n = str(e.get("name", "")).strip()
-            if not n:
-                continue
-            names_default.append(n)
-            is_dir_map[n] = bool(e.get("isDir", False))
-
-        self._is_dir_map = is_dir_map
-
-        gp = self._grid_params(len(names_default))
-        saved = self._get_saved_order(names_default)
-        self.current_order = saved[:]
-        self._enforce_folder_first_grouping()
-
-        for entry in item_entries:
-            name = str(entry.get("name", "")).strip()
-            if not name:
-                continue
-
-            is_dir = bool(entry.get("isDir", False))
-            pix = self._pick_icon_for_entry(name, is_dir)
-
-            it = IconItem(pix, name, is_dir)
-            it.setBaseScale(gp["icon_scale"])
-            it.setToolTip(name)
-            it._update_label_text(display_name=name, scale_factor=gp["icon_scale"])
-
-            self.scene.addItem(it)
-            self.item_by_name[name] = it
-
-        self._sync_icon_selection()
-        self._relayout_to_order(gp)
-        self._reposition_path_badge()
-        self._reposition_version_badge()
-        self._reposition_taskbar()
-        self._save_order_for_current_folder()
-
-        if not names_default:
-            self._show_center_message("This folder is empty.")
-        else:
-            self._hide_center_message()
-
-    # ---------------- folder listing ----------------
-    def load_folder(self, path):
-        path = normalize_api_path(path)
-
-        if self.backend is None:
-            self.last_load_error = ""
-            self.current_path = path
-            self.update_path_label()
-            self.scene.clear()
-            self.current_items = []
-            self.item_by_name = {}
-            self.current_order = []
-            self.selected_names.clear()
-            self.scene.setSceneRect(QRectF(0, 0, self.view.viewport().width(), self.view.viewport().height()))
-            self._show_center_message(self.DISCONNECTED_MESSAGE)
-            self.view.viewport().update()
-            return
-
-        try:
-            items = self._backend_list_dir(path)
-        except Exception as e:
-            error_text = str(e)
-            if error_text != self.last_load_error:
-                print("SSH Error:", e)
-                self.last_load_error = error_text
-            self.current_path = path
-            self.update_path_label()
-            self.scene.clear()
-            self.current_items = []
-            self.item_by_name = {}
-            self.current_order = []
-            self.selected_names.clear()
-            self.scene.setSceneRect(QRectF(0, 0, self.view.viewport().width(), self.view.viewport().height()))
-            self._show_center_message(self.DISCONNECTED_MESSAGE)
-            self.view.viewport().update()
-            return
-
-        if items is None:
-            items = []
-
-        self.last_load_error = ""
-        self.current_path = path
-        self.current_items = items
-        self.update_path_label()
-        self._record_recent_path(path)
-        self._render_folder_items()
 
     # ---------------- context menu: rename/delete/download ----------------
-    def show_item_context_menu(self, name: str, is_dir: bool, screen_pos: QPoint):
-        if name not in self.selected_names:
-            self._select_icon_by_name(name)
-
-        menu = QMenu(self)
-        act_properties = menu.addAction(self.T["properties"])
-        act_properties.setIcon(self._make_icon("fa6s.circle-info", "#8bd3ff"))
-        act_copy_path = menu.addAction(self.T["copy_path"])
-        act_copy_path.setIcon(self._make_icon("fa6s.copy", "#8bd3ff"))
-        act_favorite = None
-        if is_dir:
-            folder_path = join_server_path(self.current_path, name)
-            folder_favorites = self._clean_saved_paths(self.cfg.get("favorites", []), limit=50)
-            act_favorite = menu.addAction(
-                self.T["remove_favorite"] if normalize_api_path(folder_path) in folder_favorites else self.T["add_folder_favorite"]
-            )
-            act_favorite.setIcon(self._make_icon("fa6s.star", "#f4c76b"))
-        menu.addSeparator()
-        act_rename = menu.addAction(self.T["rename"])
-        act_rename.setIcon(self._make_icon("fa6s.pen", "#f4c76b"))
-        act_delete = menu.addAction(self.T["delete"])
-        act_delete.setIcon(self._make_icon("fa6s.trash-can-arrow-up", "#f4c76b"))
-        act_delete_permanent = menu.addAction(self.T["delete_permanently"])
-        act_delete_permanent.setIcon(self._make_icon("fa6s.trash", "#ff7b7b"))
-        menu.addSeparator()
-        act_copy = menu.addAction(self.T["copy_to"])
-        act_copy.setIcon(self._make_icon("fa6s.copy", "#8bd3ff"))
-        act_move = menu.addAction(self.T["move_to"])
-        act_move.setIcon(self._make_icon("fa6s.arrows-right-left", "#8bd3ff"))
-        act_compress = menu.addAction(self.T["compress_zip"])
-        act_compress.setIcon(self._make_icon("fa6s.file-zipper", "#53d18b"))
-
-        act_download = None
-        act_extract = None
-        act_extract_to = None
-        if not is_dir:
-            if self._is_archive_name(name):
-                menu.addSeparator()
-                act_extract = menu.addAction(self.T["extract_here"])
-                act_extract.setIcon(self._make_icon("fa6s.box-open", "#53d18b"))
-                act_extract_to = menu.addAction(self.T["extract_to"])
-                act_extract_to.setIcon(self._make_icon("fa6s.folder-open", "#53d18b"))
-            menu.addSeparator()
-            act_download = menu.addAction(self.T["download"])
-            act_download.setIcon(self._make_icon("fa6s.download", "#8bd3ff"))
-
-        chosen = menu.exec(screen_pos)
-        if chosen == act_properties:
-            self._show_item_properties(name)
-        elif chosen == act_copy_path:
-            self._copy_remote_path_to_clipboard(join_server_path(self.current_path, name))
-        elif act_favorite is not None and chosen == act_favorite:
-            self._toggle_favorite_path(join_server_path(self.current_path, name))
-        elif chosen == act_rename:
-            self._start_inline_rename(name)
-        elif chosen == act_delete:
-            self._delete_item(name)
-        elif chosen == act_delete_permanent:
-            self._delete_item(name, permanent=True)
-        elif chosen == act_copy:
-            self._copy_item_to(name)
-        elif chosen == act_move:
-            self._move_item_to(name)
-        elif chosen == act_compress:
-            self._compress_item_to_zip(name)
-        elif act_extract is not None and chosen == act_extract:
-            self._extract_item_here(name)
-        elif act_extract_to is not None and chosen == act_extract_to:
-            self._extract_item_to(name)
-        elif act_download is not None and chosen == act_download:
-            self._download_item(name)
-
-    def _download_item(self, name: str):
-        remote_path = join_server_path(self.current_path, name)
-
-        suggested = os.path.basename(name) if name else "download.bin"
-        save_path, _ = QFileDialog.getSaveFileName(self, self.T["download"], suggested, "All Files (*.*)")
-        if not save_path:
-            return
-
-        try:
-            self._backend_download_file(remote_path, save_path)
-        except Exception as e:
-            QMessageBox.warning(self, self.T["download"], f"{self.T['download_failed']}:\n{e}")
-            return
-
-        self.show_toast(self.T["downloaded"], "fa6s.cloud-arrow-down", "#53d18b")
-
-    def _show_item_properties(self, name: str):
-        remote_path = join_server_path(self.current_path, name)
-        try:
-            info = self._backend_get_path_info(remote_path)
-        except Exception as e:
-            QMessageBox.warning(self, self.T["properties_title"], f"{self.T['properties_failed']}:\n{e}")
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"{self.T['properties_title']} - {name}")
-        dlg.setMinimumWidth(460)
-        dlg.setStyleSheet("""
-            QDialog { background: rgba(14,18,26,0.98); }
-            QLabel { color: #eef3f9; }
-            QLineEdit {
-                color: #f3f7fc;
-                background: rgba(255,255,255,0.08);
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 10px;
-                padding: 8px 10px;
-            }
-            QToolButton {
-                color: #eef3f9;
-                background: rgba(255,255,255,0.08);
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 10px;
-                padding: 8px 14px;
-            }
-            QToolButton:hover {
-                background: rgba(110,168,255,0.16);
-                border: 1px solid rgba(110,168,255,0.34);
-            }
-        """)
-
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(14)
-
-        form = QFormLayout()
-        form.setSpacing(10)
-
-        modified_text = "-"
-        try:
-            modified_text = datetime.fromtimestamp(int(info.get("modTime", 0))).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            pass
-
-        details = [
-            (self.T["type"], self.T["folder"] if info.get("isDir") else self.T["file"]),
-            (self.T["path"], self._display_server_path(info.get("path", "."))),
-            (self.T["size"], self._format_remote_size(info.get("size", 0))),
-            (self.T["modified"], modified_text),
-            (self.T["octal_mode"], info.get("octal", "---")),
-            (self.T["symbolic_mode"], info.get("permissions", "---------")),
-        ]
-
-        for label_text, value_text in details:
-            value = QLabel(str(value_text))
-            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            value.setWordWrap(True)
-            form.addRow(f"{label_text}:", value)
-
-        layout.addLayout(form)
-
-        perm_row = QHBoxLayout()
-        perm_label = QLabel(f"{self.T['permissions_label']}:")
-        perm_edit = QLineEdit(info.get("octal", "755"))
-        perm_edit.setMaxLength(4)
-        perm_edit.setFixedWidth(100)
-        btn_apply = QToolButton()
-        btn_apply.setText(self.T["permissions_apply"])
-        perm_row.addWidget(perm_label)
-        perm_row.addWidget(perm_edit)
-        perm_row.addWidget(btn_apply)
-        perm_row.addStretch()
-        layout.addLayout(perm_row)
-
-        btn_close_row = QHBoxLayout()
-        btn_close_row.addStretch()
-        btn_close = QToolButton()
-        btn_close.setText(self.T["about_close"])
-        btn_close.clicked.connect(dlg.accept)
-        btn_close_row.addWidget(btn_close)
-        layout.addLayout(btn_close_row)
-
-        def apply_permissions():
-            mode_text = (perm_edit.text() or "").strip()
-            try:
-                self._backend_chmod(remote_path, mode_text)
-            except Exception as e:
-                QMessageBox.warning(dlg, self.T["properties_title"], f"{self.T['permissions_failed']}:\n{e}")
-                return
-            self.show_toast(self.T["permissions_changed"], "fa6s.shield-halved", "#53d18b")
-            dlg.accept()
-            self.load_folder(self.current_path)
-
-        btn_apply.clicked.connect(apply_permissions)
-        dlg.exec()
-
-    def _delete_item(self, name: str, *, permanent: bool = False):
-        remote_path = join_server_path(self.current_path, name)
-        pretty = "/" if normalize_api_path(remote_path) == "." else ("/" + normalize_api_path(remote_path))
-
-        res = QMessageBox.question(
-            self,
-            self.T["delete_title"],
-            (self.T["permanent_delete_q"] if permanent else self.T["trash_q"]).format(path=pretty),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if res != QMessageBox.StandardButton.Yes:
-            return
-
-        try:
-            trash_path = "" if permanent else self._backend_trash(remote_path)
-            if permanent:
-                self._backend_delete(remote_path)
-        except Exception as e:
-            failure_text = self.T["delete_failed"] if permanent else self.T["trash_failed"]
-            QMessageBox.warning(self, self.T["delete_title"], f"{failure_text}:\n{e}")
-            return
-
-        if name in self.current_order:
-            self.current_order = [n for n in self.current_order if n != name]
-            self._save_order_for_current_folder(self.current_order)
-
-        if not permanent:
-            self.show_toast(f"{self.T['trashed']}: {self._display_server_path(trash_path)}", "fa6s.trash-can-arrow-up", "#f4c76b")
-
-        self.load_folder(self.current_path)
-
-    def _delete_selected_items(self, *, permanent: bool = False):
-        names = self._selected_existing_names()
-        if not names:
-            return
-        if len(names) == 1:
-            self._delete_item(names[0], permanent=permanent)
-            return
-
-        preview = "\n".join(f"- {name}" for name in names[:12])
-        if len(names) > 12:
-            preview += f"\n... and {len(names) - 12} more"
-        action_text = "permanently delete" if permanent else "move to .xyra-trash"
-        res = QMessageBox.question(
-            self,
-            self.T["delete_title"],
-            f"{action_text.capitalize()} {len(names)} selected items?\n\n{preview}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if res != QMessageBox.StandardButton.Yes:
-            return
-
-        errors = []
-        for name in names:
-            remote_path = join_server_path(self.current_path, name)
-            try:
-                if permanent:
-                    self._backend_delete(remote_path)
-                else:
-                    self._backend_trash(remote_path)
-            except Exception as e:
-                errors.append(f"{name}: {e}")
-
-        self.selected_names.difference_update(names)
-        self.current_order = [n for n in self.current_order if n not in names]
-        self._save_order_for_current_folder(self.current_order)
-        self.load_folder(self.current_path)
-
-        if errors:
-            QMessageBox.warning(self, self.T["delete_failed"], "\n".join(errors[:8]))
-        else:
-            self.show_toast(f"{len(names)} items updated", "fa6s.trash-can-arrow-up", "#f4c76b")
-
-    def _display_server_path(self, path: str) -> str:
-        norm = normalize_api_path(path)
-        if norm in ("", "."):
-            return "/"
-        return "/" + norm
-
-    def _copy_remote_path_to_clipboard(self, path: str):
-        QApplication.clipboard().setText(self._display_server_path(path))
-        self.show_toast(self.T["path_copied"], "fa6s.copy", "#53d18b")
-
-    def _format_remote_size(self, size_value) -> str:
-        try:
-            size_int = int(size_value or 0)
-        except Exception:
-            size_int = 0
-
-        units = ["bytes", "KB", "MB", "GB", "TB"]
-        size_float = float(size_int)
-        unit_index = 0
-        while size_float >= 1024.0 and unit_index < len(units) - 1:
-            size_float /= 1024.0
-            unit_index += 1
-
-        if unit_index == 0:
-            return f"{size_int:,} bytes"
-
-        return f"{size_float:.2f} {units[unit_index]} ({size_int:,} bytes)"
-
-    def _is_archive_name(self, name: str) -> bool:
-        lower = (name or "").lower()
-        return any(lower.endswith(ext) for ext in self.ARCHIVE_EXTS)
-
-    def _target_folder_choices(self):
-        choices = ["/"]
-
-        current_display = self._display_server_path(self.current_path)
-        if current_display not in choices:
-            choices.append(current_display)
-
-        if self.backend:
-            try:
-                root_entries = self.backend.list_dir(".")
-                root_dirs = sorted(
-                    [
-                        self._display_server_path(entry.get("name", ""))
-                        for entry in root_entries
-                        if entry.get("isDir") and entry.get("name")
-                    ],
-                    key=str.lower,
-                )
-                for item in root_dirs:
-                    if item not in choices:
-                        choices.append(item)
-            except Exception:
-                pass
-
-        return choices
-
-    def _choose_target_folder(self, title: str, current_name: str):
-        choices = self._target_folder_choices()
-        target_dir, ok = QInputDialog.getItem(
-            self,
-            title,
-            self.T["target_folder_prompt"],
-            choices,
-            0,
-            True,
-        )
-        if not ok:
-            return None
-        target_dir = normalize_api_path((target_dir or "").strip())
-        if not target_dir:
-            QMessageBox.warning(self, title, self.T["target_invalid"])
-            return None
-        source_path = join_server_path(self.current_path, current_name)
-        dest_path = join_server_path(target_dir, current_name)
-        if normalize_api_path(source_path) == normalize_api_path(dest_path):
-            return None
-        return source_path, dest_path
-
-    def _copy_item_to(self, name: str):
-        chosen = self._choose_target_folder(self.T["copy_title"], name)
-        if not chosen:
-            return
-        source_path, dest_path = chosen
-        self._run_remote_job(
-            title=self.T["copy_title"],
-            busy_text=self.T["copying"].format(name=os.path.basename(name) or name),
-            success_toast=self.T["copy_done"],
-            failure_label=self.T["copy_failed"],
-            worker=lambda: self._backend_copy(source_path, dest_path),
-        )
-
-    def _move_item_to(self, name: str):
-        chosen = self._choose_target_folder(self.T["move_title"], name)
-        if not chosen:
-            return
-        source_path, dest_path = chosen
-        self._run_remote_job(
-            title=self.T["move_title"],
-            busy_text=self.T["moving"].format(name=os.path.basename(name) or name),
-            success_toast=self.T["move_done"],
-            failure_label=self.T["move_failed"],
-            worker=lambda: self._backend_move(source_path, dest_path),
-        )
-
-    def _extract_item_here(self, name: str):
-        archive_path = join_server_path(self.current_path, name)
-        self._run_remote_job(
-            title=self.T["extract_title"],
-            busy_text=self.T["extracting"].format(name=os.path.basename(name) or name),
-            success_toast=self.T["extract_done"],
-            failure_label=self.T["extract_failed"],
-            worker=lambda: self._backend_extract_archive(archive_path, self.current_path),
-        )
-
-    def _extract_item_to(self, name: str):
-        chosen = self._choose_target_folder(self.T["extract_title"], name)
-        if not chosen:
-            return
-        archive_path, dest_path = chosen
-        self._run_remote_job(
-            title=self.T["extract_title"],
-            busy_text=self.T["extracting"].format(name=os.path.basename(name) or name),
-            success_toast=self.T["extract_done"],
-            failure_label=self.T["extract_failed"],
-            worker=lambda: self._backend_extract_archive(archive_path, dest_path),
-        )
-
-    def _compress_item_to_zip(self, name: str):
-        base_name = name
-        if "." in name:
-            split_base = os.path.splitext(name)[0]
-            if split_base:
-                base_name = split_base
-        default_name = f"{base_name}.zip"
-        archive_name, ok = QInputDialog.getText(
-            self,
-            self.T["compress_title"],
-            self.T["archive_name_prompt"],
-            text=default_name,
-        )
-        if not ok:
-            return
-        archive_name = (archive_name or "").strip()
-        if not archive_name:
-            QMessageBox.warning(self, self.T["compress_title"], self.T["archive_name_invalid"])
-            return
-        if "/" in archive_name or "\\" in archive_name:
-            QMessageBox.warning(self, self.T["compress_title"], self.T["rename_invalid"])
-            return
-        if not archive_name.lower().endswith(".zip"):
-            archive_name += ".zip"
-
-        source_path = join_server_path(self.current_path, name)
-        archive_path = join_server_path(self.current_path, archive_name)
-        self._run_remote_job(
-            title=self.T["compress_title"],
-            busy_text=self.T["compressing"].format(name=os.path.basename(name) or name),
-            success_toast=self.T["compress_done"],
-            failure_label=self.T["compress_failed"],
-            worker=lambda: self._backend_compress_zip(source_path, archive_path),
-        )
-
-    def _run_remote_job(self, *, title: str, busy_text: str, success_toast: str, failure_label: str, worker):
-        if self._remote_job_active:
-            self.show_toast(self.T["remote_job_busy"], "fa6s.hourglass-half", "#f4c76b")
-            return
-
-        self._remote_job_active = True
-        self._show_upload_overlay(busy_text)
-
-        def job():
-            try:
-                worker()
-                self.remote_job_done.emit(success_toast)
-            except Exception as e:
-                self.remote_job_failed.emit(title, failure_label, str(e))
-
-        threading.Thread(target=job, daemon=True).start()
-
-    def _finish_remote_job_success(self, success_toast: str):
-        self._remote_job_active = False
-        self._hide_upload_overlay()
-        self.show_toast(success_toast, "fa6s.circle-check", "#53d18b")
-        self.load_folder(self.current_path)
-
-    def _finish_remote_job_error(self, title: str, failure_label: str, error_text: str):
-        self._remote_job_active = False
-        self._hide_upload_overlay()
-        QMessageBox.warning(self, title, f"{failure_label}:\n{error_text}")
 
     # ---------------- inline rename ----------------
-    def _start_inline_rename(self, name: str):
-        it = self.item_by_name.get(name)
-        if not it or not it.text_item:
-            return
-
-        label_scene_pos = it.text_item.scenePos()
-        label_scene_rect = it.text_item.boundingRect()
-        label_scene_rect = QRectF(label_scene_pos.x(), label_scene_pos.y(), label_scene_rect.width(), label_scene_rect.height())
-
-        vp_top_left = self.view.mapFromScene(QPointF(label_scene_rect.left(), label_scene_rect.top()))
-        vp_bot_right = self.view.mapFromScene(QPointF(label_scene_rect.right(), label_scene_rect.bottom()))
-
-        x = int(vp_top_left.x())
-        y = int(vp_top_left.y())
-        w = max(120, int(vp_bot_right.x() - vp_top_left.x()) + 18)
-        h = max(24, int(vp_bot_right.y() - vp_top_left.y()) + 12)
-
-        self.rename_target_item = it
-        self.rename_old_name = name
-
-        self.rename_editor.setGeometry(x - 8, y - 6, w + 16, h)
-        self.rename_editor.setText(name)
-        self.rename_editor.show()
-        self.rename_editor.raise_()
-        self.rename_editor.setFocus()
-
-        ext = split_ext(name)
-        if ext and name.lower().endswith(ext):
-            base_len = len(name) - len(ext)
-            self.rename_editor.setSelection(0, base_len)
-        else:
-            self.rename_editor.selectAll()
-
-    def eventFilter(self, obj, event):
-        if obj is self.rename_editor:
-            if event.type() == event.Type.KeyPress:
-                if event.key() == Qt.Key.Key_Escape:
-                    self._cancel_inline_rename()
-                    return True
-        return super().eventFilter(obj, event)
-
-    def _cancel_inline_rename(self):
-        self.rename_editor.hide()
-        self.rename_target_item = None
-        self.rename_old_name = ""
-
-    def _commit_inline_rename(self):
-        if not self.rename_editor.isVisible():
-            return
-
-        new_name = (self.rename_editor.text() or "").strip()
-        old_name = self.rename_old_name
-        target_item = self.rename_target_item
-
-        self._cancel_inline_rename()
-
-        if not target_item or not old_name:
-            return
-        if new_name == old_name:
-            return
-        if not is_valid_new_name(new_name):
-            QMessageBox.warning(self, self.T["rename"], self.T["rename_invalid"])
-            return
-
-        old_path = join_server_path(self.current_path, old_name)
-        new_path = join_server_path(self.current_path, new_name)
-
-        try:
-            self._backend_rename(old_path, new_path)
-        except Exception as e:
-            QMessageBox.warning(self, self.T["rename"], f"{self.T['rename_failed']}:\n{e}")
-            return
-
-        if old_name in self.current_order:
-            self.current_order = [new_name if n == old_name else n for n in self.current_order]
-            # after rename, enforce grouping again
-            self._enforce_folder_first_grouping()
-            self._save_order_for_current_folder(self.current_order)
-
-        self.load_folder(self.current_path)
-
-    # ---------------- open/save ----------------
-    def icon_double_clicked_by_name(self, name: str, is_dir: bool, shift_open: bool):
-        new_path = join_server_path(self.current_path, name)
-
-        if is_dir:
-            if not self._can_change_path():
-                return
-            self.history.append(self.current_path)
-            self.future.clear()
-            self.current_path = normalize_api_path(new_path)
-            self.update_path_label()
-            self.load_folder(self.current_path)
-            return
-
-        ext = split_ext(name)
-        if shift_open:
-            self._download_and_open_external(new_path, name)
-            return
-
-        if ext in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tga", ".ico"}:
-            self._download_and_open_image_preview(new_path, name)
-            return
-
-        if ext in TEXT_EXTS:
-            try:
-                data = self._backend_read_bytes(new_path)
-            except Exception as e:
-                print("Download error:", e)
-                return
-            try:
-                text = data.decode("utf-8")
-            except Exception:
-                text = data.decode("utf-8", errors="replace")
-
-            try:
-                editor = TextEditorWindow(new_path, text, self.save_file_to_server)
-                self.open_editors.append(editor)
-                editor.destroyed.connect(lambda _, e=editor: self._on_editor_destroyed(e))
-                editor.show()
-                editor.raise_()
-                editor.activateWindow()
-            except Exception as e:
-                print("Failed to open editor:", e)
-            return
-
-        self._download_and_open_external(new_path, name)
-
-    def _on_editor_destroyed(self, editor_obj):
-        try:
-            self.open_editors.remove(editor_obj)
-        except ValueError:
-            pass
-
-    def _on_preview_destroyed(self, preview_obj):
-        try:
-            self.open_previews.remove(preview_obj)
-        except ValueError:
-            pass
-
-    def _show_image_preview_dialog(self, local_path: str, display_name: str):
-        preview = ImagePreviewDialog(
-            local_path,
-            display_name,
-            open_external_cb=lambda p=local_path: os.startfile(p),
-            parent=self,
-        )
-        self.open_previews.append(preview)
-        preview.destroyed.connect(lambda _, p=preview: self._on_preview_destroyed(p))
-        preview.show()
-        preview.raise_()
-        preview.activateWindow()
-
-    def _download_and_open_image_preview(self, remote_path: str, name: str):
-        task_key = normalize_api_path(remote_path)
-        if task_key in self._active_external_opens:
-            return
-
-        self._active_external_opens.add(task_key)
-        self.show_toast(f"Loading preview for {os.path.basename(name) or name}...", "fa6s.image", "#8bd3ff")
-
-        def worker():
-            try:
-                suffix = split_ext(name) or ".png"
-                safe_name = os.path.basename(name) or "image"
-                digest = hashlib.sha1(task_key.encode("utf-8", errors="ignore")).hexdigest()[:12]
-                tmp_path = os.path.join(self.external_open_dir, f"{digest}_{safe_name}")
-                if suffix and not tmp_path.lower().endswith(suffix.lower()):
-                    tmp_path += suffix
-
-                self._backend_download_file(remote_path, tmp_path)
-                self.preview_ready.emit(tmp_path, os.path.basename(name) or name)
-            except Exception as e:
-                print("Open preview failed:", e)
-            finally:
-                self._active_external_opens.discard(task_key)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _download_and_open_external(self, remote_path: str, name: str):
-        task_key = normalize_api_path(remote_path)
-        if task_key in self._active_external_opens:
-            return
-
-        self._active_external_opens.add(task_key)
-        self.show_toast(f"Opening {os.path.basename(name) or name}...", "fa6s.up-right-from-square", "#8bd3ff")
-
-        def worker():
-            try:
-                suffix = split_ext(name) or ".bin"
-                safe_name = os.path.basename(name) or "download"
-                digest = hashlib.sha1(task_key.encode("utf-8", errors="ignore")).hexdigest()[:12]
-                tmp_path = os.path.join(self.external_open_dir, f"{digest}_{safe_name}")
-                if suffix and not tmp_path.lower().endswith(suffix.lower()):
-                    tmp_path += suffix
-
-                self._backend_download_file(remote_path, tmp_path)
-                os.startfile(tmp_path)
-            except Exception as e:
-                print("Open external failed:", e)
-            finally:
-                self._active_external_opens.discard(task_key)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def save_file_to_server(self, remote_path, content) -> tuple:
-        try:
-            backup_key = normalize_api_path(remote_path)
-            if backup_key not in self._editor_backup_paths:
-                self._backend_backup_file(remote_path)
-                self._editor_backup_paths.add(backup_key)
-            self._backend_write_text(remote_path, content)
-        except Exception as e:
-            return False, str(e)
-        return True, ""
 
     # ---------------- navigation ----------------
     def go_back(self):
         if not self._can_change_path():
             return
         if self.history:
-            self.future.append(self.current_path)
-            self.current_path = self.history.pop()
-            self.update_path_label()
-            self.load_folder(self.current_path)
+            self.load_folder(self.history[-1], navigation_mode="back")
 
     def go_forward(self):
         if not self._can_change_path():
             return
         if self.future:
-            self.history.append(self.current_path)
-            self.current_path = self.future.pop()
-            self.update_path_label()
-            self.load_folder(self.current_path)
+            self.load_folder(self.future[-1], navigation_mode="forward")
 
     # ---------------- UI helpers ----------------
     def change_background(self):
         fname, _ = QFileDialog.getOpenFileName(
             self, self.T["choose_bg"], os.path.expanduser("~"),
-            "Images (*.png *.jpg *.jpeg *.png *.webp *.bmp *.ico)"
+            "Images (*.png *.jpg *.jpeg *.png *.gif *.webp *.bmp *.ico)"
         )
         if not fname:
             return
@@ -3148,10 +2066,47 @@ class RemoteDesktop(QMainWindow):
         self._update_background_pixmap()
         self.view.viewport().update()
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
+    @staticmethod
+    def _centered_window_rect(available: QRect, saved_size) -> QRect:
+        try:
+            saved_width = int(saved_size[0])
+            saved_height = int(saved_size[1])
+        except (TypeError, ValueError, IndexError):
+            saved_width = 1600
+            saved_height = 900
 
-        self._update_background_pixmap()
+        max_width = max(320, available.width() - 64)
+        max_height = max(280, available.height() - 64)
+        min_width = min(900, max_width)
+        min_height = min(600, max_height)
+        width = max(min_width, min(saved_width, max_width))
+        height = max(min_height, min(saved_height, max_height))
+        x = available.x() + (available.width() - width) // 2
+        y = available.y() + (available.height() - height) // 2
+        return QRect(x, y, width, height)
+
+    def _apply_initial_window_geometry(self):
+        screen = QApplication.primaryScreen() or self.screen()
+        if screen is None:
+            self.resize(1600, 900)
+            return
+        target = self._centered_window_rect(
+            screen.availableGeometry(),
+            self.cfg.get("window_size"),
+        )
+        self.resize(target.size())
+        self.move(target.topLeft())
+
+    def _enable_window_geometry_saving(self):
+        self._window_geometry_ready = True
+
+    def resizeEvent(self, a0: QResizeEvent | None):
+        super().resizeEvent(a0)
+
+        # Resizing can produce dozens of events per second. Keep the lightweight
+        # overlays responsive and defer expensive scaling/layout/disk work until
+        # the user pauses dragging the window edge.
+        self._background_resize_timer.start()
 
         if self.drop_overlay.isVisible():
             self.drop_overlay.setGeometry(self.view.viewport().rect())
@@ -3160,26 +2115,42 @@ class RemoteDesktop(QMainWindow):
                 lines = self.upload_overlay.text().split("\n", 1)
                 self._show_search_overlay(lines[0], lines[1] if len(lines) > 1 else "")
             else:
-                self.upload_overlay.adjustSize()
+                self._show_upload_overlay(self.upload_overlay.text())
 
         self._reposition_path_badge()
         self._reposition_version_badge()
         self._reposition_taskbar()
+        self._update_responsive_toolbar()
         if self.center_message.isVisible():
-            self._show_center_message(self.center_message.text())
+            self._show_center_message(self._center_message_source)
 
-        try:
-            if not self.isMaximized():
-                s = self.size()
-                if s.width() >= 200 and s.height() >= 200:
-                    self.cfg["window_size"] = [int(s.width()), int(s.height())]
-                    save_config(self.cfg)
-        except Exception:
-            pass
+        if (
+            self._window_geometry_ready
+            and self.isVisible()
+            and not self.isMaximized()
+            and not self.isFullScreen()
+            and not self.isMinimized()
+        ):
+            self._window_size_save_timer.start()
 
         self._relayout_timer.start()
 
-    def keyPressEvent(self, event):
+    def _save_window_size(self):
+        try:
+            if not self._window_geometry_ready:
+                return
+            if not self.isMaximized() and not self.isFullScreen() and not self.isMinimized():
+                size = self.size()
+                if size.width() >= 200 and size.height() >= 200:
+                    self.cfg["window_size"] = [int(size.width()), int(size.height())]
+            save_config(self.cfg)
+        except Exception:
+            pass
+
+    def keyPressEvent(self, a0: QKeyEvent | None):
+        if a0 is None:
+            return
+        event = a0
         selected_name = self._primary_selected_name()
 
         if event.matches(QKeySequence.StandardKey.SelectAll):
@@ -3210,12 +2181,46 @@ class RemoteDesktop(QMainWindow):
                 super().keyPressEvent(event)
         elif event.key() == Qt.Key.Key_Escape:
             self.go_back()
+        elif self._handle_type_select_key(event):
+            return
         else:
             super().keyPressEvent(event)
+
+    def closeEvent(self, a0: QCloseEvent | None):
+        if self._exit_shutdown_done:
+            super().closeEvent(a0)
+            return
+        self._exit_shutdown_done = True
+        self._folder_load_generation += 1
+        self._capture_active_server_tab_state()
+        self._save_current_server_workspace()
+        self._save_window_size()
+        self.transfer_queue.shutdown()
+        backend = self.backend
+        self.backend = None
+        self.cfg["connection_mode"] = "none"
+        save_config(self.cfg)
+        if backend is not None:
+            try:
+                backend.disconnect()
+            except Exception:
+                pass
+        try:
+            self.discord_rpc.close()
+        except Exception:
+            pass
+        super().closeEvent(a0)
 
 
 # ------------------- Run -------------------
 if __name__ == "__main__":
-    window = RemoteDesktop()
+    app = create_application(sys.argv)
+    launch_profile = ""
+    if "--profile" in sys.argv:
+        try:
+            launch_profile = sys.argv[sys.argv.index("--profile") + 1]
+        except (IndexError, ValueError):
+            launch_profile = ""
+    window = RemoteDesktop(launch_profile_name=launch_profile)
     window.show()
     sys.exit(app.exec())
