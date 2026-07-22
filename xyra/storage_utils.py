@@ -2,6 +2,7 @@ import configparser
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 
 from xyra.app_constants import CONFIG_FILE, GUI_CONFIG_FILE, ICONS_POS_FILE, STATE_DB_FILE
 from xyra.secret_storage import clear_password, load_password, save_password
@@ -9,6 +10,7 @@ from xyra.secret_storage import clear_password, load_password, save_password
 
 GUI_DEFAULTS = {
     "background": "",
+    "icon_pack_key": "",
     "icon_pack_path": "",
     "window_width": 1600,
     "window_height": 900,
@@ -23,6 +25,9 @@ STATE_DEFAULTS = {
     "ssh_profile_name": "",
     "putty_path": "",
     "termius_path": "",
+    "server_workspaces": {},
+    "update_channel": "stable",
+    "automatic_update_checks": True,
 }
 
 
@@ -87,6 +92,23 @@ def save_favorites(paths):
         print("Cannot save favorites:", e)
 
 
+def save_server_workspace(identity: str, workspace: dict):
+    if not identity:
+        return
+    try:
+        with _state_db() as con:
+            _init_state_db(con)
+            con.execute("BEGIN IMMEDIATE")
+            workspaces = _json_state_get(con, "server_workspaces", {})
+            if not isinstance(workspaces, dict):
+                workspaces = {}
+            workspaces[str(identity)] = dict(workspace or {})
+            _state_set(con, "server_workspaces", json.dumps(workspaces))
+            con.commit()
+    except Exception as e:
+        print("Cannot save server workspace:", e)
+
+
 def load_icons_pos():
     try:
         with _state_db() as con:
@@ -126,6 +148,7 @@ def save_icons_pos(data):
 def _load_gui_config():
     cfg = {
         "background": GUI_DEFAULTS["background"],
+        "icon_pack_key": GUI_DEFAULTS["icon_pack_key"],
         "icon_pack_path": GUI_DEFAULTS["icon_pack_path"],
         "window_size": [GUI_DEFAULTS["window_width"], GUI_DEFAULTS["window_height"]],
         "show_favorites_only": GUI_DEFAULTS["show_favorites_only"],
@@ -143,6 +166,7 @@ def _load_gui_config():
             cfg["window_size"] = [max(200, width), max(200, height)]
         if parser.has_section("display"):
             cfg["background"] = parser.get("display", "background", fallback=GUI_DEFAULTS["background"])
+            cfg["icon_pack_key"] = parser.get("display", "icon_pack_key", fallback=GUI_DEFAULTS["icon_pack_key"])
             cfg["icon_pack_path"] = parser.get("display", "icon_pack_path", fallback=GUI_DEFAULTS["icon_pack_path"])
         if parser.has_section("view"):
             cfg["show_favorites_only"] = parser.getboolean(
@@ -164,6 +188,9 @@ def _load_gui_config():
                 icon_pack_path = legacy.get("icon_pack_path")
                 if isinstance(icon_pack_path, str):
                     cfg["icon_pack_path"] = icon_pack_path
+                icon_pack_key = legacy.get("icon_pack_key")
+                if isinstance(icon_pack_key, str):
+                    cfg["icon_pack_key"] = icon_pack_key
                 ws = legacy.get("window_size")
                 if isinstance(ws, (list, tuple)) and len(ws) == 2:
                     cfg["window_size"] = [max(200, int(ws[0])), max(200, int(ws[1]))]
@@ -191,6 +218,7 @@ def _save_gui_config(cfg: dict):
     }
     parser["display"] = {
         "background": str(cfg.get("background") or ""),
+        "icon_pack_key": str(cfg.get("icon_pack_key") or ""),
         "icon_pack_path": str(cfg.get("icon_pack_path") or ""),
     }
     parser["view"] = {
@@ -214,6 +242,12 @@ def _load_state_config():
             cfg["ssh_profile_name"] = _text_state_get(con, "ssh_profile_name", STATE_DEFAULTS["ssh_profile_name"])
             cfg["putty_path"] = _text_state_get(con, "putty_path", STATE_DEFAULTS["putty_path"])
             cfg["termius_path"] = _text_state_get(con, "termius_path", STATE_DEFAULTS["termius_path"])
+            cfg["server_workspaces"] = _json_state_get(con, "server_workspaces", {})
+            channel = _text_state_get(con, "update_channel", STATE_DEFAULTS["update_channel"])
+            cfg["update_channel"] = channel if channel in ("stable", "prerelease") else "stable"
+            cfg["automatic_update_checks"] = _text_state_get(
+                con, "automatic_update_checks", "1"
+            ) != "0"
             cfg["ssh_profiles"] = _load_profiles_from_db(con)
             active_profile = _resolve_active_profile(cfg)
             cfg.update(active_profile)
@@ -233,15 +267,23 @@ def _save_state_config(cfg: dict):
         _state_set(con, "ssh_profile_name", str(cfg.get("ssh_profile_name") or cfg.get("profile_name") or ""))
         _state_set(con, "putty_path", str(cfg.get("putty_path") or ""))
         _state_set(con, "termius_path", str(cfg.get("termius_path") or ""))
-
+        channel = str(cfg.get("update_channel") or "stable")
+        _state_set(con, "update_channel", channel if channel in ("stable", "prerelease") else "stable")
+        _state_set(con, "automatic_update_checks", "1" if cfg.get("automatic_update_checks", True) else "0")
         profiles = cfg.get("ssh_profiles")
         if isinstance(profiles, list):
             _save_profiles_to_db(con, profiles)
         con.commit()
 
 
+@contextmanager
 def _state_db():
-    return sqlite3.connect(STATE_DB_FILE)
+    con = sqlite3.connect(STATE_DB_FILE, timeout=5.0)
+    con.execute("PRAGMA busy_timeout = 5000")
+    try:
+        yield con
+    finally:
+        con.close()
 
 
 def _init_state_db(con):

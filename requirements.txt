@@ -1,4 +1,6 @@
-PyQt6
-paramiko
-qtawesome
-keyring
+PyQt6==6.10.2
+paramiko==5.0.0
+cryptography==46.0.5
+qtawesome==1.4.1
+keyring==25.7.0
+pypresence==4.6.1

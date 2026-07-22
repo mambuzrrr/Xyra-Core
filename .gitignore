@@ -3,6 +3,11 @@ __pycache__/
 *.pyo
 *.pyd
 .vscode/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+test-results/
 
 .env
 .env.*
@@ -28,7 +33,7 @@ app.manifest
 
 build/
 dist/
-build_windows_exe.ps1
+release_artifacts/
 web/
 *.exe
 *.msi
@@ -36,3 +41,6 @@ web/
 *.7z
 *.spec
 !Xyra.spec
+
+# Local-only development files
+/tests/

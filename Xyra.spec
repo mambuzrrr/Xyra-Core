@@ -18,6 +18,7 @@ hiddenimports += qtawesome_hiddenimports
 hiddenimports += [
     "keyring.backends.Windows",
     "keyring.backends.fail",
+    "pypresence",
 ]
 
 a = Analysis(
@@ -43,7 +44,9 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX-packed executables trigger more heuristic antivirus detections and
+    # make release output harder to reproduce and inspect.
+    upx=False,
     upx_exclude=[],
     console=False,
     disable_windowed_traceback=False,
