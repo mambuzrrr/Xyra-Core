@@ -24,6 +24,14 @@
   <a href="SECURITY.md"><strong>Security</strong></a>
 </p>
 
+<p align="center">
+  <img src="assets/screenshots/xyra-remote-workspace.png" alt="Xyra connected to a Linux VPS" width="100%">
+</p>
+
+<p align="center">
+  <sub>A connected Linux workspace in Xyra - direct over SSH and SFTP.</sub>
+</p>
+
 ---
 
 ## What Xyra actually is
@@ -74,6 +82,14 @@ to work. Xyra combines familiar desktop interaction with remote-aware safety and
 - Preview remote images and open safe files externally when needed.
 - Inspect ownership, UID/GID, symbolic and octal permissions, plus MD5/SHA1/SHA256.
 - Work with common archives including ZIP, RAR, 7z, PK3 and IWD.
+
+<p align="center">
+  <img src="assets/screenshots/xyra-file-properties.png" alt="Remote file properties and Linux permissions in Xyra" width="420">
+</p>
+
+<p align="center">
+  <sub>Inspect remote metadata and edit Linux permissions without losing sight of what each mode means.</sub>
+</p>
 
 ### Transfers without freezing the interface
 
